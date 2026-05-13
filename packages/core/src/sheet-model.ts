@@ -85,3 +85,23 @@ export function setCellValue(
     cells: next,
   };
 }
+
+/**
+ * Sets the width of a specific column. Returns a new SheetData.
+ */
+export function setColumnWidth(sheet: SheetData, col: number, width: number): SheetData {
+  const next = new Map(sheet.columns);
+  const existing = next.get(col);
+  next.set(col, { width, hidden: existing?.hidden });
+  return { ...sheet, columns: next };
+}
+
+/**
+ * Sets the height of a specific row. Returns a new SheetData.
+ */
+export function setRowHeight(sheet: SheetData, row: number, height: number): SheetData {
+  const next = new Map(sheet.rows);
+  const existing = next.get(row);
+  next.set(row, { height, hidden: existing?.hidden });
+  return { ...sheet, rows: next };
+}

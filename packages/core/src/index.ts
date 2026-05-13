@@ -8,6 +8,8 @@ export {
   getColumnWidth,
   getRowHeight,
   setCellValue,
+  setColumnWidth,
+  setRowHeight,
 } from './sheet-model';
 export type {
   CellData,

@@ -19,8 +19,6 @@ export default defineConfig({
         { text: 'Formula', link: '/api/formula' },
       ],
     },
-    socialLinks: [
-      { icon: 'github', link: 'https://github.com' },
-    ],
+    socialLinks: [{ icon: 'github', link: 'https://github.com' }],
   },
 });

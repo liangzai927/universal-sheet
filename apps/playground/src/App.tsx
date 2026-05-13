@@ -68,6 +68,11 @@ export default function App() {
     }
   }, []);
 
+  const handleSheetChange = useCallback((sheet: SheetData) => {
+    sheetDataRef.current = sheet;
+    setSheetData(sheet);
+  }, []);
+
   /* ---- Zoom controls ---- */
 
   const handleZoomIn = () => {
@@ -235,6 +240,7 @@ export default function App() {
           onReady={handleReady}
           onSelectionChange={handleSelectionChange}
           onCellChange={handleCellChange}
+          onSheetChange={handleSheetChange}
         />
       </div>
     </div>

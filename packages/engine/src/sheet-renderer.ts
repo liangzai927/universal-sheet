@@ -5,6 +5,8 @@ import {
   getColumnWidth,
   getRowHeight,
   setCellValue,
+  setColumnWidth,
+  setRowHeight,
 } from '@universal-sheet/core';
 
 import {
@@ -13,10 +15,8 @@ import {
   type ContentSize,
   createViewport,
   DEFAULT_THEME,
-  getContentSize,
   getScrollbarInfo,
   getScrollbarThickness,
-  getVisibleRange,
   panViewport,
   type SheetTheme,
   thumbToScroll,
@@ -52,6 +52,10 @@ export interface RendererConfig {
   readonly onPaste?: () => string | null;
   /** Called whenever the viewport changes (scroll / zoom / resize). */
   readonly onViewportChange?: () => void;
+  /** Called when a column width is changed by dragging. */
+  readonly onColumnResize?: (col: number, width: number) => void;
+  /** Called when a row height is changed by dragging. */
+  readonly onRowResize?: (row: number, height: number) => void;
 }
 
 /**
@@ -72,6 +76,18 @@ export class SheetRenderer {
   private onCopy?: (value: string) => void;
   private onPaste?: () => string | null;
   private onViewportChange?: () => void;
+  private onColumnResize?: (col: number, width: number) => void;
+  private onRowResize?: (row: number, height: number) => void;
+
+  /** Column resize drag state. */
+  private resizingCol = -1;
+  private resizeStartX = 0;
+  private resizeStartWidth = 0;
+
+  /** Row resize drag state. */
+  private resizingRow = -1;
+  private resizeStartY = 0;
+  private resizeStartHeight = 0;
 
   private devicePixelRatio: number;
   private boundHandleWheel: (e: WheelEvent) => void;
@@ -90,7 +106,7 @@ export class SheetRenderer {
   private renderQueued = false;
 
   /** Cached content size (world pixels), re-computed when config changes. */
-  private contentSize: ContentSize;
+  private contentSize!: ContentSize;
 
   constructor(config: RendererConfig) {
     this.canvas = config.canvas;
@@ -101,6 +117,8 @@ export class SheetRenderer {
     this.onCopy = config.onCopy;
     this.onPaste = config.onPaste;
     this.onViewportChange = config.onViewportChange;
+    this.onColumnResize = config.onColumnResize;
+    this.onRowResize = config.onRowResize;
     this.devicePixelRatio = window.devicePixelRatio || 1;
 
     const ctx = config.canvas.getContext('2d');
@@ -113,14 +131,7 @@ export class SheetRenderer {
       config.sheet.config.initialZoom,
     );
 
-    this.contentSize = getContentSize(
-      config.sheet.config.headerColWidth,
-      config.sheet.config.headerRowHeight,
-      config.sheet.config.colCount,
-      config.sheet.config.rowCount,
-      config.sheet.config.defaultColWidth,
-      config.sheet.config.defaultRowHeight,
-    );
+    this.recalcContentSize();
     this.viewport = clampViewport(this.viewport, this.contentSize);
 
     this.boundHandleWheel = this.handleWheel.bind(this);
@@ -146,7 +157,15 @@ export class SheetRenderer {
    */
   updateSheet(sheet: SheetData): void {
     this.sheet = sheet;
+    this.recalcContentSize();
     this.queueRender();
+  }
+
+  private recalcContentSize(): void {
+    this.contentSize = {
+      width: this.getTotalWidth(),
+      height: this.getTotalHeight(),
+    };
   }
 
   /**
@@ -201,12 +220,11 @@ export class SheetRenderer {
    */
   getCellRect(row: number, col: number): CellRect {
     const { zoom, scrollX, scrollY } = this.viewport;
-    const { headerColWidth, headerRowHeight } = this.sheet.config;
     const colW = getColumnWidth(this.sheet, col);
     const rowH = getRowHeight(this.sheet, row);
 
-    const worldX = headerColWidth + col * this.sheet.config.defaultColWidth;
-    const worldY = headerRowHeight + row * this.sheet.config.defaultRowHeight;
+    const worldX = this.getColumnX(col);
+    const worldY = this.getRowY(row);
 
     return {
       x: worldX * zoom + scrollX,
@@ -414,6 +432,26 @@ export class SheetRenderer {
     const x = e.clientX - rect.left;
     const y = e.clientY - rect.top;
 
+    /* Column resize: start dragging if mouse is near a column edge. */
+    const edgeCol = this.detectColumnEdge(x, y);
+    if (edgeCol >= 0) {
+      this.resizingCol = edgeCol;
+      this.resizeStartX = x;
+      this.resizeStartWidth = getColumnWidth(this.sheet, edgeCol);
+      e.preventDefault();
+      return;
+    }
+
+    /* Row resize: start dragging if mouse is near a row edge. */
+    const edgeRow = this.detectRowEdge(x, y);
+    if (edgeRow >= 0) {
+      this.resizingRow = edgeRow;
+      this.resizeStartY = y;
+      this.resizeStartHeight = getRowHeight(this.sheet, edgeRow);
+      e.preventDefault();
+      return;
+    }
+
     const sb = getScrollbarInfo(this.viewport, this.contentSize);
     const sbSize = getScrollbarThickness();
     const { canvasWidth, canvasHeight } = this.viewport;
@@ -471,34 +509,95 @@ export class SheetRenderer {
   }
 
   private handleMouseMove(e: MouseEvent): void {
-    if (!this.scrollbarDrag) return;
-
     const rect = this.canvas.getBoundingClientRect();
-    const pos = this.scrollbarDrag === 'h' ? e.clientX - rect.left : e.clientY - rect.top;
-    const delta = pos - this.scrollbarDragLastPos;
-    this.scrollbarDragLastPos = pos;
+    const x = e.clientX - rect.left;
+    const y = e.clientY - rect.top;
 
-    const contentLength =
-      this.scrollbarDrag === 'h'
-        ? this.contentSize.width * this.viewport.zoom
-        : this.contentSize.height * this.viewport.zoom;
-
-    const sb = getScrollbarInfo(this.viewport, this.contentSize);
-    const trackLength = this.scrollbarDrag === 'h' ? sb.h.trackLength : sb.v.trackLength;
-
-    const scrollDelta = thumbToScroll(delta, contentLength, trackLength);
-
-    let vp: ViewportState;
-    if (this.scrollbarDrag === 'h') {
-      vp = panViewport(this.viewport, -scrollDelta, 0);
-    } else {
-      vp = panViewport(this.viewport, 0, -scrollDelta);
+    /* Row resize drag. */
+    if (this.resizingRow >= 0) {
+      const { zoom } = this.viewport;
+      const delta = (y - this.resizeStartY) / zoom;
+      const newHeight = Math.max(12, this.resizeStartHeight + delta);
+      const rowH = getRowHeight(this.sheet, this.resizingRow);
+      if (Math.abs(newHeight - rowH) > 0.5) {
+        const updated = setRowHeight(this.sheet, this.resizingRow, newHeight);
+        this.sheet = updated;
+        this.recalcContentSize();
+        this.viewport = clampViewport(this.viewport, this.contentSize);
+        this.queueRender();
+      }
+      return;
     }
-    this.viewport = clampViewport(vp, this.contentSize);
-    this.notifyViewportChange();
+
+    /* Column resize drag. */
+    if (this.resizingCol >= 0) {
+      const { zoom } = this.viewport;
+      const delta = (x - this.resizeStartX) / zoom;
+      const newWidth = Math.max(20, this.resizeStartWidth + delta);
+      const colW = getColumnWidth(this.sheet, this.resizingCol);
+      if (Math.abs(newWidth - colW) > 0.5) {
+        /* Update internal sheet without full round-trip. */
+        const updated = setColumnWidth(this.sheet, this.resizingCol, newWidth);
+        this.sheet = updated;
+        this.recalcContentSize();
+        this.viewport = clampViewport(this.viewport, this.contentSize);
+        this.queueRender();
+      }
+      return;
+    }
+
+    /* Scrollbar drag. */
+    if (this.scrollbarDrag) {
+      const pos = this.scrollbarDrag === 'h' ? x : y;
+      const delta = pos - this.scrollbarDragLastPos;
+      this.scrollbarDragLastPos = pos;
+
+      const contentLength =
+        this.scrollbarDrag === 'h'
+          ? this.contentSize.width * this.viewport.zoom
+          : this.contentSize.height * this.viewport.zoom;
+
+      const sb = getScrollbarInfo(this.viewport, this.contentSize);
+      const trackLength = this.scrollbarDrag === 'h' ? sb.h.trackLength : sb.v.trackLength;
+
+      const scrollDelta = thumbToScroll(delta, contentLength, trackLength);
+
+      let vp: ViewportState;
+      if (this.scrollbarDrag === 'h') {
+        vp = panViewport(this.viewport, -scrollDelta, 0);
+      } else {
+        vp = panViewport(this.viewport, 0, -scrollDelta);
+      }
+      this.viewport = clampViewport(vp, this.contentSize);
+      this.notifyViewportChange();
+      return;
+    }
+
+    /* Update cursor for column/row edge hover. */
+    const edgeCol = this.detectColumnEdge(x, y);
+    const edgeRow = this.detectRowEdge(x, y);
+    if (edgeCol >= 0) {
+      this.canvas.style.cursor = 'col-resize';
+    } else if (edgeRow >= 0) {
+      this.canvas.style.cursor = 'row-resize';
+    } else {
+      this.canvas.style.cursor = '';
+    }
   }
 
   private handleMouseUp(_e: MouseEvent): void {
+    if (this.resizingCol >= 0) {
+      const newWidth = getColumnWidth(this.sheet, this.resizingCol);
+      this.onColumnResize?.(this.resizingCol, newWidth);
+      this.resizingCol = -1;
+      this.canvas.style.cursor = '';
+    }
+    if (this.resizingRow >= 0) {
+      const newHeight = getRowHeight(this.sheet, this.resizingRow);
+      this.onRowResize?.(this.resizingRow, newHeight);
+      this.resizingRow = -1;
+      this.canvas.style.cursor = '';
+    }
     this.scrollbarDrag = null;
   }
 
@@ -512,20 +611,87 @@ export class SheetRenderer {
    */
   private pixelToCell(x: number, y: number): CellPosition | null {
     const { zoom, scrollX, scrollY } = this.viewport;
-    const { headerColWidth, headerRowHeight } = this.sheet.config;
+    const { headerColWidth, headerRowHeight, colCount, rowCount } = this.sheet.config;
 
     const worldX = (x - scrollX) / zoom;
     const worldY = (y - scrollY) / zoom;
 
     if (worldX < headerColWidth || worldY < headerRowHeight) return null;
 
-    const col = Math.floor((worldX - headerColWidth) / this.sheet.config.defaultColWidth);
-    const row = Math.floor((worldY - headerRowHeight) / this.sheet.config.defaultRowHeight);
+    /* Find column by accumulating widths. */
+    let accX = headerColWidth;
+    let col = -1;
+    for (let c = 0; c < colCount; c++) {
+      const cw = getColumnWidth(this.sheet, c);
+      if (worldX >= accX && worldX < accX + cw) {
+        col = c;
+        break;
+      }
+      accX += cw;
+    }
+    if (col < 0) return null;
 
-    if (col < 0 || col >= this.sheet.config.colCount) return null;
-    if (row < 0 || row >= this.sheet.config.rowCount) return null;
+    /* Find row by accumulating heights. */
+    let accY = headerRowHeight;
+    let row = -1;
+    for (let r = 0; r < rowCount; r++) {
+      const rh = getRowHeight(this.sheet, r);
+      if (worldY >= accY && worldY < accY + rh) {
+        row = r;
+        break;
+      }
+      accY += rh;
+    }
+    if (row < 0) return null;
 
     return createPosition(row, col);
+  }
+
+  /**
+   * Detects if the mouse is near the right edge of a column header.
+   * Returns the column index, or -1 if not near any edge.
+   */
+  private detectColumnEdge(canvasX: number, canvasY: number): number {
+    const HIT_DISTANCE = 5;
+    const { zoom, scrollX } = this.viewport;
+    const { headerRowHeight, colCount } = this.sheet.config;
+
+    const headerBottom = headerRowHeight * zoom;
+    if (canvasY < 0 || canvasY > headerBottom) return -1;
+
+    const worldX = (canvasX - scrollX) / zoom;
+    for (let c = 0; c < colCount; c++) {
+      const rightEdgeWorld = this.getColumnX(c) + getColumnWidth(this.sheet, c);
+      const dist = Math.abs(worldX - rightEdgeWorld);
+      if (dist <= HIT_DISTANCE / zoom) {
+        return c;
+      }
+    }
+    return -1;
+  }
+
+  /**
+   * Detects if the mouse is near the bottom edge of a row header.
+   * Returns the row index, or -1 if not near any edge.
+   */
+  private detectRowEdge(canvasX: number, canvasY: number): number {
+    const HIT_DISTANCE = 5;
+    const { zoom, scrollY } = this.viewport;
+    const { headerColWidth, rowCount } = this.sheet.config;
+
+    /* Row header is pinned to left: transform is translate(0, scrollY). */
+    const headerRight = headerColWidth * zoom;
+    if (canvasX < 0 || canvasX > headerRight) return -1;
+
+    const worldY = (canvasY - scrollY) / zoom;
+    for (let r = 0; r < rowCount; r++) {
+      const bottomEdgeWorld = this.getRowY(r) + getRowHeight(this.sheet, r);
+      const dist = Math.abs(worldY - bottomEdgeWorld);
+      if (dist <= HIT_DISTANCE / zoom) {
+        return r;
+      }
+    }
+    return -1;
   }
 
   /* ------------------------------------------------------------------ */
@@ -541,6 +707,95 @@ export class SheetRenderer {
     this.canvas.width = width * dpr;
     this.canvas.height = height * dpr;
     this.ctx.setTransform(dpr, 0, 0, dpr, 0, 0);
+  }
+
+  /**
+   * Returns the world-x position of the left edge of column `col`.
+   * Accounts for per-column widths set via setColumnWidth.
+   */
+  private getColumnX(col: number): number {
+    let x = this.sheet.config.headerColWidth;
+    for (let c = 0; c < col; c++) {
+      x += getColumnWidth(this.sheet, c);
+    }
+    return x;
+  }
+
+  private getTotalWidth(): number {
+    let w = this.sheet.config.headerColWidth;
+    for (let c = 0; c < this.sheet.config.colCount; c++) {
+      w += getColumnWidth(this.sheet, c);
+    }
+    return w;
+  }
+
+  /**
+   * Returns the world-y position of the top edge of row `row`.
+   */
+  private getRowY(row: number): number {
+    let y = this.sheet.config.headerRowHeight;
+    for (let r = 0; r < row; r++) {
+      y += getRowHeight(this.sheet, r);
+    }
+    return y;
+  }
+
+  private getTotalHeight(): number {
+    let h = this.sheet.config.headerRowHeight;
+    for (let r = 0; r < this.sheet.config.rowCount; r++) {
+      h += getRowHeight(this.sheet, r);
+    }
+    return h;
+  }
+
+  /** Returns visible column range accounting for per-column widths. */
+  private getVisibleCols(): { firstCol: number; lastCol: number } {
+    const { zoom, scrollX, canvasWidth } = this.viewport;
+    const { headerColWidth, colCount } = this.sheet.config;
+    const effectiveW = canvasWidth - getScrollbarThickness();
+
+    let cursorX = headerColWidth * zoom + scrollX;
+    let firstCol = 0;
+    while (firstCol < colCount && cursorX + getColumnWidth(this.sheet, firstCol) * zoom < 0) {
+      cursorX += getColumnWidth(this.sheet, firstCol) * zoom;
+      firstCol++;
+    }
+
+    let lastCol = firstCol;
+    while (lastCol < colCount && cursorX < effectiveW) {
+      cursorX += getColumnWidth(this.sheet, lastCol) * zoom;
+      lastCol++;
+    }
+
+    return {
+      firstCol: Math.max(0, firstCol),
+      lastCol: Math.min(colCount - 1, Math.max(firstCol, lastCol)),
+    };
+  }
+
+  /** Returns visible row range accounting for per-row heights. */
+  private getVisibleRows(): { firstRow: number; lastRow: number } {
+    const { zoom, scrollY, canvasHeight } = this.viewport;
+    const { headerRowHeight, rowCount } = this.sheet.config;
+    const effectiveH = canvasHeight - getScrollbarThickness();
+
+    let cursorY = headerRowHeight * zoom + scrollY;
+    let firstRow = 0;
+    while (firstRow < rowCount && cursorY + getRowHeight(this.sheet, firstRow) * zoom < 0) {
+      cursorY += getRowHeight(this.sheet, firstRow) * zoom;
+      firstRow++;
+    }
+
+    let lastRow = firstRow;
+    while (lastRow < rowCount && cursorY < effectiveH) {
+      cursorY += getRowHeight(this.sheet, lastRow) * zoom;
+      lastRow++;
+    }
+
+    return {
+      firstRow: Math.max(0, firstRow),
+      lastRow: Math.min(rowCount - 1, Math.max(firstRow, lastRow)),
+    };
   }
 
   /* ------------------------------------------------------------------ */
@@ -617,44 +872,45 @@ export class SheetRenderer {
 
   private renderColumnHeaders(): void {
     const { ctx, theme } = this;
-    const {
-      headerColWidth,
-      headerRowHeight,
-      defaultColWidth,
-      defaultRowHeight,
-      colCount,
-      rowCount,
-    } = this.sheet.config;
+    const { headerColWidth, headerRowHeight } = this.sheet.config;
 
-    const visible = getVisibleRange(
-      this.viewport,
-      headerColWidth,
-      headerRowHeight,
-      defaultColWidth,
-      defaultRowHeight,
-      colCount,
-      rowCount,
-    );
+    const vis = this.getVisibleCols();
+    const totalW = this.getTotalWidth();
 
     ctx.fillStyle = theme.headerBg;
-    ctx.fillRect(headerColWidth, 0, colCount * defaultColWidth, headerRowHeight);
+    ctx.fillRect(headerColWidth, 0, totalW - headerColWidth, headerRowHeight);
+
+    /* Highlight selected column header. */
+    if (this.selectedCell) {
+      const selX = this.getColumnX(this.selectedCell.col);
+      const selW = getColumnWidth(this.sheet, this.selectedCell.col);
+      ctx.fillStyle = theme.headerSelectedBg;
+      ctx.fillRect(selX, 0, selW, headerRowHeight);
+    }
 
     ctx.font = `${theme.headerFontSize}px ${theme.fontFamily}`;
     ctx.fillStyle = theme.headerTextColor;
     ctx.textAlign = 'center';
     ctx.textBaseline = 'middle';
 
-    for (let c = visible.firstCol; c <= visible.lastCol; c++) {
-      const x = headerColWidth + c * defaultColWidth;
-      ctx.fillText(columnLabel(c), x + defaultColWidth / 2, headerRowHeight / 2);
+    for (let c = vis.firstCol; c <= vis.lastCol; c++) {
+      const x = this.getColumnX(c);
+      const w = getColumnWidth(this.sheet, c);
+      ctx.fillText(columnLabel(c), x + w / 2, headerRowHeight / 2);
     }
 
-    // Bottom border
+    // Vertical grid lines in column headers
     ctx.strokeStyle = theme.gridLine;
     ctx.lineWidth = 1 / this.viewport.zoom;
     ctx.beginPath();
+    for (let c = vis.firstCol; c <= vis.lastCol + 1; c++) {
+      const x = this.getColumnX(c);
+      ctx.moveTo(x, 0);
+      ctx.lineTo(x, headerRowHeight);
+    }
+    // Bottom border
     ctx.moveTo(headerColWidth, headerRowHeight);
-    ctx.lineTo(headerColWidth + colCount * defaultColWidth, headerRowHeight);
+    ctx.lineTo(totalW, headerRowHeight);
     ctx.stroke();
   }
 
@@ -664,44 +920,45 @@ export class SheetRenderer {
 
   private renderRowHeaders(): void {
     const { ctx, theme } = this;
-    const {
-      headerColWidth,
-      headerRowHeight,
-      defaultColWidth,
-      defaultRowHeight,
-      colCount,
-      rowCount,
-    } = this.sheet.config;
+    const { headerColWidth, headerRowHeight } = this.sheet.config;
 
-    const visible = getVisibleRange(
-      this.viewport,
-      headerColWidth,
-      headerRowHeight,
-      defaultColWidth,
-      defaultRowHeight,
-      colCount,
-      rowCount,
-    );
+    const vis = this.getVisibleRows();
+    const totalH = this.getTotalHeight();
 
     ctx.fillStyle = theme.headerBg;
-    ctx.fillRect(0, headerRowHeight, headerColWidth, rowCount * defaultRowHeight);
+    ctx.fillRect(0, headerRowHeight, headerColWidth, totalH - headerRowHeight);
+
+    /* Highlight selected row header. */
+    if (this.selectedCell) {
+      const selY = this.getRowY(this.selectedCell.row);
+      const selH = getRowHeight(this.sheet, this.selectedCell.row);
+      ctx.fillStyle = theme.headerSelectedBg;
+      ctx.fillRect(0, selY, headerColWidth, selH);
+    }
 
     ctx.font = `${theme.headerFontSize}px ${theme.fontFamily}`;
     ctx.fillStyle = theme.headerTextColor;
     ctx.textAlign = 'center';
     ctx.textBaseline = 'middle';
 
-    for (let r = visible.firstRow; r <= visible.lastRow; r++) {
-      const y = headerRowHeight + r * defaultRowHeight;
-      ctx.fillText(String(r + 1), headerColWidth / 2, y + defaultRowHeight / 2);
+    for (let r = vis.firstRow; r <= vis.lastRow; r++) {
+      const y = this.getRowY(r);
+      const h = getRowHeight(this.sheet, r);
+      ctx.fillText(String(r + 1), headerColWidth / 2, y + h / 2);
     }
 
-    // Right border
+    // Horizontal grid lines in row headers
     ctx.strokeStyle = theme.gridLine;
     ctx.lineWidth = 1 / this.viewport.zoom;
     ctx.beginPath();
+    for (let r = vis.firstRow; r <= vis.lastRow + 1; r++) {
+      const y = this.getRowY(r);
+      ctx.moveTo(0, y);
+      ctx.lineTo(headerColWidth, y);
+    }
+    // Right border
     ctx.moveTo(headerColWidth, headerRowHeight);
-    ctx.lineTo(headerColWidth, headerRowHeight + rowCount * defaultRowHeight);
+    ctx.lineTo(headerColWidth, totalH);
     ctx.stroke();
   }
 
@@ -728,21 +985,16 @@ export class SheetRenderer {
   /** Fills the entire data area with the data background color. */
   private renderDataBg(): void {
     const { ctx, theme } = this;
-    const {
-      headerColWidth,
-      headerRowHeight,
-      defaultColWidth,
-      defaultRowHeight,
-      colCount,
-      rowCount,
-    } = this.sheet.config;
+    const { headerRowHeight } = this.sheet.config;
+    const totalW = this.getTotalWidth();
+    const totalH = this.getTotalHeight();
 
     ctx.fillStyle = theme.dataBg;
     ctx.fillRect(
-      headerColWidth,
+      this.getColumnX(0),
       headerRowHeight,
-      colCount * defaultColWidth,
-      rowCount * defaultRowHeight,
+      totalW - this.sheet.config.headerColWidth,
+      totalH - headerRowHeight,
     );
   }
 
@@ -752,43 +1004,31 @@ export class SheetRenderer {
 
   private renderGridLines(): void {
     const { ctx, theme } = this;
-    const {
-      headerColWidth,
-      headerRowHeight,
-      defaultColWidth,
-      defaultRowHeight,
-      colCount,
-      rowCount,
-    } = this.sheet.config;
+    const { headerColWidth, headerRowHeight } = this.sheet.config;
 
-    const visible = getVisibleRange(
-      this.viewport,
-      headerColWidth,
-      headerRowHeight,
-      defaultColWidth,
-      defaultRowHeight,
-      colCount,
-      rowCount,
-    );
+    const visCols = this.getVisibleCols();
+    const visRows = this.getVisibleRows();
+    const totalW = this.getTotalWidth();
+    const totalH = this.getTotalHeight();
 
     ctx.strokeStyle = theme.gridLine;
     ctx.lineWidth = 1 / this.viewport.zoom;
 
-    // Vertical lines
+    // Vertical lines at each column boundary
     ctx.beginPath();
-    for (let c = visible.firstCol; c <= visible.lastCol + 1; c++) {
-      const x = headerColWidth + c * defaultColWidth;
+    for (let c = visCols.firstCol; c <= visCols.lastCol + 1; c++) {
+      const x = this.getColumnX(c);
       ctx.moveTo(x, headerRowHeight);
-      ctx.lineTo(x, headerRowHeight + rowCount * defaultRowHeight);
+      ctx.lineTo(x, totalH);
     }
     ctx.stroke();
 
-    // Horizontal lines
+    // Horizontal lines at each row boundary
     ctx.beginPath();
-    for (let r = visible.firstRow; r <= visible.lastRow + 1; r++) {
-      const y = headerRowHeight + r * defaultRowHeight;
+    for (let r = visRows.firstRow; r <= visRows.lastRow + 1; r++) {
+      const y = this.getRowY(r);
       ctx.moveTo(headerColWidth, y);
-      ctx.lineTo(headerColWidth + colCount * defaultColWidth, y);
+      ctx.lineTo(totalW, y);
     }
     ctx.stroke();
   }
@@ -799,35 +1039,20 @@ export class SheetRenderer {
 
   private renderCells(): void {
     const { ctx, theme, sheet } = this;
-    const {
-      headerColWidth,
-      headerRowHeight,
-      defaultColWidth,
-      defaultRowHeight,
-      colCount,
-      rowCount,
-    } = sheet.config;
 
-    const visible = getVisibleRange(
-      this.viewport,
-      headerColWidth,
-      headerRowHeight,
-      defaultColWidth,
-      defaultRowHeight,
-      colCount,
-      rowCount,
-    );
+    const visCols = this.getVisibleCols();
+    const visRows = this.getVisibleRows();
 
     ctx.font = `${theme.cellFontSize}px ${theme.fontFamily}`;
     ctx.textBaseline = 'middle';
 
-    for (let r = visible.firstRow; r <= visible.lastRow; r++) {
-      for (let c = visible.firstCol; c <= visible.lastCol; c++) {
+    for (let r = visRows.firstRow; r <= visRows.lastRow; r++) {
+      for (let c = visCols.firstCol; c <= visCols.lastCol; c++) {
         const cell = getCellData(sheet, r, c);
         if (cell?.value == null) continue;
 
-        const x = headerColWidth + c * defaultColWidth;
-        const y = headerRowHeight + r * defaultRowHeight;
+        const x = this.getColumnX(c);
+        const y = this.getRowY(r);
         const colW = getColumnWidth(sheet, c);
         const rowH = getRowHeight(sheet, r);
 
@@ -870,19 +1095,12 @@ export class SheetRenderer {
 
     const { ctx, theme } = this;
     const { row, col } = this.selectedCell;
-    const {
-      headerColWidth,
-      headerRowHeight,
-      defaultColWidth,
-      defaultRowHeight,
-      colCount,
-      rowCount,
-    } = this.sheet.config;
+    const { rowCount, colCount } = this.sheet.config;
 
     if (row >= rowCount || col >= colCount) return;
 
-    const x = headerColWidth + col * defaultColWidth;
-    const y = headerRowHeight + row * defaultRowHeight;
+    const x = this.getColumnX(col);
+    const y = this.getRowY(row);
     const colW = getColumnWidth(this.sheet, col);
     const rowH = getRowHeight(this.sheet, row);
 

@@ -6,6 +6,8 @@ export interface SheetTheme {
   readonly headerBg: string;
   /** Background color of the header on hover. */
   readonly headerHoverBg: string;
+  /** Background color of the selected column/row header. */
+  readonly headerSelectedBg: string;
   /** Color of the grid lines. */
   readonly gridLine: string;
   /** Color of regular cell text. */
@@ -37,6 +39,7 @@ export const DEFAULT_THEME: Readonly<SheetTheme> = {
   dataBg: '#ffffff',
   headerBg: '#f0f0f0',
   headerHoverBg: '#e0e0e0',
+  headerSelectedBg: '#d3e3fd',
   gridLine: '#d4d4d4',
   textColor: '#1a1a1a',
   headerTextColor: '#4a4a4a',

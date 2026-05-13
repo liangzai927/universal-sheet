@@ -1,5 +1,11 @@
 import type { CellPosition, SheetData } from '@universal-sheet/core';
-import { createSheetData, getCellData, setCellValue } from '@universal-sheet/core';
+import {
+  createSheetData,
+  getCellData,
+  setCellValue,
+  setColumnWidth as setColW,
+  setRowHeight,
+} from '@universal-sheet/core';
 import { SheetRenderer } from '@universal-sheet/engine';
 import { memo, useCallback, useEffect, useRef, useState } from 'react';
 
@@ -16,6 +22,8 @@ interface SheetViewProps {
   readonly onReady?: (renderer: SheetRenderer) => void;
   /** Called when a cell's value changes via editing or paste. */
   readonly onCellChange?: (sheet: SheetData, pos: CellPosition, value: string) => void;
+  /** Called when the sheet data is modified internally (e.g. column resize). */
+  readonly onSheetChange?: (sheet: SheetData) => void;
 }
 
 /**
@@ -27,6 +35,7 @@ export const SheetView = memo(function SheetView({
   onSelectionChange,
   onReady,
   onCellChange,
+  onSheetChange,
 }: SheetViewProps) {
   const canvasRef = useRef<HTMLCanvasElement>(null);
   const inputRef = useRef<HTMLInputElement>(null);
@@ -83,6 +92,14 @@ export const SheetView = memo(function SheetView({
       onPaste: () => copyBuffer.current,
       onViewportChange: () => {
         setEditState(null);
+      },
+      onColumnResize: (col: number, width: number) => {
+        const updated = setColW(sheetDataRef.current, col, width);
+        onSheetChange?.(updated);
+      },
+      onRowResize: (row: number, height: number) => {
+        const updated = setRowHeight(sheetDataRef.current, row, height);
+        onSheetChange?.(updated);
       },
     });
 

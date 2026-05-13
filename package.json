@@ -34,7 +34,7 @@
     "lint": "turbo run lint",
     "format": "prettier --write .",
     "format:check": "prettier --check .",
-    "typecheck": "tsc --noEmit",
+    "typecheck": "tsc -b --noEmit",
     "clean": "rm -rf packages/*/dist apps/*/dist .turbo",
     "docs:dev": "turbo run docs:dev",
     "docs:build": "turbo run docs:build",

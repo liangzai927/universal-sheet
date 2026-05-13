@@ -2,12 +2,19 @@ import tseslint from 'typescript-eslint';
 import simpleImportSort from 'eslint-plugin-simple-import-sort';
 
 export default tseslint.config(
-  { ignores: ['**/dist', '**/.turbo', '**/node_modules', '**/.vitepress/cache', '**/.vitepress/config.ts', '**/vite.config.ts'] },
   {
-    extends: [
-      ...tseslint.configs.strictTypeChecked,
-      ...tseslint.configs.stylisticTypeChecked,
+    ignores: [
+      '**/dist',
+      '**/.turbo',
+      '**/node_modules',
+      '**/.vitepress/cache',
+      '**/.vitepress/config.ts',
+      '**/vite.config.ts',
+      '**/vitest.config.ts',
     ],
+  },
+  {
+    extends: [...tseslint.configs.strictTypeChecked, ...tseslint.configs.stylisticTypeChecked],
     files: ['**/*.{ts,tsx,vue}'],
     languageOptions: {
       parserOptions: {
