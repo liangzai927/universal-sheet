@@ -1,0 +1,11 @@
+{
+  "files": [],
+  "references": [
+    { "path": "./packages/core" },
+    { "path": "./packages/engine" },
+    { "path": "./packages/formula" },
+    { "path": "./packages/shared" },
+    { "path": "./packages/ui-vue" },
+    { "path": "./packages/ui-react" }
+  ]
+}

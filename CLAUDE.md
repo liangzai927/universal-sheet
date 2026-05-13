@@ -1,0 +1,288 @@
+# CLAUDE.md
+
+## Project: Universal Sheet
+Excel-like frontend spreadsheet SDK. Framework-agnostic core, publishable to npm, supports Vue 3 and React. Features developed incrementally layer by layer: core → engine → UI.
+
+---
+
+## TypeScript Conventions
+
+### Strict typing — zero tolerance for `any`
+
+```ts
+// BAD
+function getCell(row: any, col: any): any { ... }
+
+// GOOD
+function getCell(row: number, col: number): CellData | null { ... }
+```
+
+- `strict: true` enforced globally (see tsconfig.base.json)
+- Prefer `interface` for public APIs, `type` for unions/primitives
+- Every function must declare explicit return type (no inference for public exports)
+- Use `readonly` on data that should not mutate
+- Use `const` assertions and `as const` for literal types
+- `unknown` over `any` — narrow with type guards before use
+- Barrel exports only: each package exports via `src/index.ts`, no deep imports between packages
+
+### Naming
+
+| Category | Convention | Example |
+|----------|-----------|---------|
+| Interface | PascalCase, no `I` prefix | `CellData`, `SheetConfig` |
+| Type alias | PascalCase | `CellValue = string \| number` |
+| Enum member | PascalCase | `CellType.Text` |
+| Variable/function | camelCase | `getCellValue`, `rowIndex` |
+| Constant | UPPER_SNAKE_CASE | `MAX_ROWS`, `DEFAULT_COL_WIDTH` |
+| Private members | camelCase, no `_` prefix | `internalState` (use `private` keyword) |
+| File name | kebab-case | `cell-model.ts`, `sheet-engine.ts` |
+
+---
+
+## Package Architecture Constraints
+
+### `packages/core` — Pure logic, zero DOM
+- **Forbidden**: `document`, `window`, `HTMLElement`, Vue/React imports
+- **Allowed**: Pure TS data structures, algorithms, event emitters
+- **Dependencies**: Only `@universal-sheet/shared`
+
+### `packages/engine` — Canvas rendering, no framework code
+- **Forbidden**: Vue/React imports, direct DOM manipulation for UI
+- **Allowed**: Canvas 2D API, `OffscreenCanvas`, requestAnimationFrame
+- **Dependencies**: `@universal-sheet/core`, `@universal-sheet/shared`
+
+### `packages/formula` — Formula parsing, pure computation
+- **Forbidden**: DOM, framework imports, side effects
+- **Allowed**: Parser combinators, AST manipulation, decimal arithmetic
+- **Dependencies**: `@universal-sheet/shared` only
+
+### `packages/shared` — Internal utilities only
+- **Never imported by external consumers** (not in npm exports)
+- Small utils: debounce, throttle, event emitter, type guards
+
+### `packages/ui-vue` — Vue 3 bindings
+- Vue 3 Composition API only (no Options API)
+- `<script setup lang="ts">` required
+- `defineProps<T>()` with interface, `defineEmits<T>()` with type
+- No direct DOM queries — use `ref`/`template ref`
+
+### `packages/ui-react` — React bindings
+- Function components only, no class components
+- Hooks for all state/logic
+- `React.memo` on pure presentational components
+- Props interfaces prefixed with component name
+
+---
+
+## Vue 2 Component Template (if `packages/ui-vue2` is added)
+
+```vue
+<script lang="ts">
+import Vue from 'vue';
+
+interface Props {
+  modelValue: string;
+  disabled?: boolean;
+}
+
+export default Vue.extend({
+  name: 'UsComponent',
+  props: {
+    modelValue: { type: String, required: true },
+    disabled: { type: Boolean, default: false },
+  },
+  model: {
+    prop: 'modelValue',
+    event: 'input',
+  },
+  methods: {
+    handleChange(value: string): void {
+      this.$emit('input', value);
+    },
+  },
+});
+</script>
+
+<template>
+  <div class="us-component" :class="{ 'us-disabled': disabled }">
+    <!-- Template content -->
+  </div>
+</template>
+```
+
+### Vue 2 constraints
+- Use `Vue.extend()` for type-safe component definitions
+- `v-model` uses `modelValue` prop + `input` event (standard Vue 2 model)
+- Props: declare types via constructor (`String`, `Number`, `Boolean`, `Object`, `Array`)
+- No mixins — prefer scoped slots or utility functions
+- CSS class prefix: `us-`
+- One component per file
+
+---
+
+## Vue 3 Component Template
+
+```vue
+<script setup lang="ts">
+interface Props {
+  /** Description of the prop */
+  readonly modelValue: string;
+  /** Optional flag with default */
+  readonly disabled?: boolean;
+}
+
+const props = withDefaults(defineProps<Props>(), {
+  disabled: false,
+});
+
+interface Emits {
+  (e: 'update:modelValue', value: string): void;
+}
+
+const emit = defineEmits<Emits>();
+</script>
+
+<template>
+  <div class="us-component" :class="{ 'us-disabled': props.disabled }">
+    <!-- Template content -->
+  </div>
+</template>
+```
+
+### Vue constraints
+- CSS class prefix: `us-` (universal-sheet)
+- Scoped styles via `<style scoped>` or CSS modules
+- No inline styles over 2 properties — extract to class
+- Component name in kebab-case for the file, PascalCase for import
+- One component per file
+
+---
+
+## React Component Template
+
+```tsx
+import { memo, useCallback, useState } from 'react';
+
+interface SheetViewProps {
+  /** The data model to render */
+  readonly data: SheetData;
+  /** Called when a cell is clicked */
+  readonly onCellClick?: (row: number, col: number) => void;
+}
+
+export const SheetView = memo(function SheetView({ data, onCellClick }: SheetViewProps) {
+  const [selectedCell, setSelectedCell] = useState<[number, number] | null>(null);
+
+  const handleCellClick = useCallback(
+    (row: number, col: number) => {
+      setSelectedCell([row, col]);
+      onCellClick?.(row, col);
+    },
+    [onCellClick],
+  );
+
+  return (
+    <div className="us-sheet-view">
+      {/* JSX content */}
+    </div>
+  );
+});
+```
+
+### React constraints
+- CSS class prefix: `us-`
+- Named exports only (no default exports)
+- `memo()` on components that receive props from parent
+- `useCallback` on event handlers passed to memo'd children
+- No inline styles over 2 properties — extract to CSS
+- Props interface: `{ComponentName}Props`
+
+---
+
+## Comment Standards
+
+### When to write comments
+- **Public API**: Every exported function/class/interface must have a JSDoc comment
+- **Non-obvious logic**: Algorithm choice, performance consideration, edge case handling
+- **Why, not what**: Explain the reason behind a decision, not what the code does
+
+```ts
+/**
+ * Parses a formula string into an AST.
+ * Uses recursive descent rather than regex to handle nested function calls.
+ */
+export function parseFormula(input: string): FormulaNode { ... }
+
+// Recalculate only dirty cells to avoid O(n²) on large sheets
+for (const cell of dirtyCells) { ... }
+```
+
+### When NOT to write comments
+- Self-documenting code: `getCellValue(row, col)` needs no comment
+- Variable declarations with clear names
+- Simple getters/setters
+
+---
+
+## Test Rules
+
+### Framework: Vitest
+
+### File location
+```
+packages/core/src/cell-model.ts
+packages/core/src/__tests__/cell-model.test.ts
+```
+
+### Naming
+- Test file: `{module-name}.test.ts`
+- Describe block: the module/function name
+- Test case: `should {expected behavior} when {condition}`
+
+### Template
+```ts
+import { describe, it, expect } from 'vitest';
+import { parseFormula } from '../formula-parser';
+
+describe('parseFormula', () => {
+  it('should parse a simple addition expression', () => {
+    const result = parseFormula('=A1+B1');
+    expect(result).toEqual({
+      type: 'binary',
+      operator: '+',
+      left: { type: 'cell-ref', ref: 'A1' },
+      right: { type: 'cell-ref', ref: 'B1' },
+    });
+  });
+
+  it('should throw FormulaError when given empty input', () => {
+    expect(() => parseFormula('')).toThrow('FormulaError');
+  });
+
+  it('should handle nested function calls', () => {
+    const result = parseFormula('=SUM(A1, AVERAGE(B1:B10))');
+    expect(result.type).toBe('function-call');
+  });
+});
+```
+
+### Test constraints
+- **Coverage target**: 80%+ on core/engine/formula, 60%+ on UI packages
+- **No test nesting** beyond `describe` → `it` (no nested describes)
+- **One assertion context per test**: test one behavior per `it` block
+- **No shared mutable state** between tests — reset in `beforeEach`
+- **Do NOT mock** `@universal-sheet/shared` internals
+- **Data factories**: Extract repeated test data setup into `test-utils.ts` files
+- **No snapshot tests** — prefer explicit `toEqual`/`toMatchObject` assertions
+- **Edge cases required** per public function: empty input, boundary values, error paths
+
+---
+
+## Code Style
+
+- **Concision over ceremony**: 3 similar lines is better than a premature abstraction
+- No classes unless state + behavior are tightly coupled — prefer functions + interfaces
+- No half-finished implementations, no `// TODO` comments, no dead code
+- No backwards-compatibility shims or feature flags
+- No `export default` — always named exports
+- Imports: external packages first, then internal `@universal-sheet/` packages, then relative
