@@ -1,8 +1,8 @@
 // @universal-sheet/engine — Canvas rendering engine.
 // No framework code allowed.
 
-export type { CellRect, RendererConfig } from './sheet-renderer';
-export { SheetRenderer } from './sheet-renderer';
+export type { CellRect, RendererConfig, SelectionRange } from './sheet-renderer';
+export { normalizeRange, SheetRenderer } from './sheet-renderer';
 export type { SheetTheme } from './theme';
 export { columnLabel, DEFAULT_THEME } from './theme';
 export type { ContentSize, ScrollbarInfo, ViewportState } from './viewport';

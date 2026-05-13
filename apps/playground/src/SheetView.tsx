@@ -2,6 +2,7 @@ import type { CellPosition, SheetData } from '@universal-sheet/core';
 import {
   createSheetData,
   getCellData,
+  getRowHeight,
   setCellValue,
   setColumnWidth as setColW,
   setRowHeight,
@@ -38,7 +39,7 @@ export const SheetView = memo(function SheetView({
   onSheetChange,
 }: SheetViewProps) {
   const canvasRef = useRef<HTMLCanvasElement>(null);
-  const inputRef = useRef<HTMLInputElement>(null);
+  const inputRef = useRef<HTMLTextAreaElement>(null);
   const rendererRef = useRef<SheetRenderer | null>(null);
 
   const [editState, setEditState] = useState<{
@@ -101,6 +102,10 @@ export const SheetView = memo(function SheetView({
         const updated = setRowHeight(sheetDataRef.current, row, height);
         onSheetChange?.(updated);
       },
+      onSheetMutated: () => {
+        /* After batch resize, re-sync the full sheet from the renderer. */
+        onSheetChange?.(renderer.getSheet());
+      },
     });
 
     rendererRef.current = renderer;
@@ -131,11 +136,24 @@ export const SheetView = memo(function SheetView({
   const commitEdit = useCallback(() => {
     if (!editState || !rendererRef.current) return;
     const { pos, value } = editState;
-    const updated = setCellValue(sheetDataRef.current, pos.row, pos.col, value);
+    let updated = setCellValue(sheetDataRef.current, pos.row, pos.col, value);
+
+    /* Auto-expand row height for multi-line content. */
+    const lines = value.split('\n').length;
+    const CELL_FONT_SIZE = 13;
+    const CELL_PADDING = 6;
+    const neededHeight = Math.max(
+      sheetDataRef.current.config.defaultRowHeight,
+      CELL_PADDING * 2 + lines * CELL_FONT_SIZE * 1.4,
+    );
+    const currentHeight = getRowHeight(updated, pos.row);
+    if (neededHeight > currentHeight) {
+      updated = setRowHeight(updated, pos.row, neededHeight);
+    }
+
     rendererRef.current.updateSheet(updated);
     onCellChange?.(updated, pos, value);
     setEditState(null);
-    /* Return focus to canvas so keyboard shortcuts keep working. */
     canvasRef.current?.focus();
   }, [editState, onCellChange]);
 
@@ -145,16 +163,23 @@ export const SheetView = memo(function SheetView({
   }, []);
 
   const handleInputKeyDown = useCallback(
-    (e: React.KeyboardEvent<HTMLInputElement>) => {
+    (e: React.KeyboardEvent<HTMLTextAreaElement>) => {
       if (e.key === 'Enter') {
+        if (e.shiftKey) {
+          /* Shift+Enter: let textarea insert newline naturally. */
+          return;
+        }
+        /* Enter: commit and move selection down. */
         e.preventDefault();
         commitEdit();
+        rendererRef.current?.moveSelectedCell(1, 0);
       } else if (e.key === 'Escape') {
         e.preventDefault();
         cancelEdit();
       } else if (e.key === 'Tab') {
         e.preventDefault();
         commitEdit();
+        rendererRef.current?.moveSelectedCell(0, e.shiftKey ? -1 : 1);
       }
     },
     [commitEdit, cancelEdit],
@@ -168,7 +193,7 @@ export const SheetView = memo(function SheetView({
         tabIndex={0}
       />
       {editState && (
-        <input
+        <textarea
           ref={inputRef}
           className="us-cell-editor"
           value={editState.value}
@@ -177,6 +202,7 @@ export const SheetView = memo(function SheetView({
           }}
           onKeyDown={handleInputKeyDown}
           onBlur={commitEdit}
+          rows={1}
           style={{
             position: 'absolute',
             left: editState.x,
@@ -191,6 +217,9 @@ export const SheetView = memo(function SheetView({
             background: '#fff',
             boxSizing: 'border-box',
             zIndex: 10,
+            resize: 'none',
+            overflow: 'hidden',
+            lineHeight: 1.4,
           }}
         />
       )}

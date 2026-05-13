@@ -32,6 +32,24 @@ export interface CellRect {
   readonly height: number;
 }
 
+/** A contiguous rectangular selection of cells. */
+export interface SelectionRange {
+  readonly startRow: number;
+  readonly startCol: number;
+  readonly endRow: number;
+  readonly endCol: number;
+}
+
+/** Creates a normalized SelectionRange regardless of direction. */
+export function normalizeRange(r1: number, c1: number, r2: number, c2: number): SelectionRange {
+  return {
+    startRow: Math.min(r1, r2),
+    startCol: Math.min(c1, c2),
+    endRow: Math.max(r1, r2),
+    endCol: Math.max(c1, c2),
+  };
+}
+
 /** Configuration for the SheetRenderer. */
 export interface RendererConfig {
   /** The canvas element to render into. */
@@ -56,6 +74,8 @@ export interface RendererConfig {
   readonly onColumnResize?: (col: number, width: number) => void;
   /** Called when a row height is changed by dragging. */
   readonly onRowResize?: (row: number, height: number) => void;
+  /** Called after any internal sheet mutation (batch resize, etc.). */
+  readonly onSheetMutated?: () => void;
 }
 
 /**
@@ -71,6 +91,9 @@ export class SheetRenderer {
   private theme: SheetTheme;
   private viewport: ViewportState;
   private selectedCell: CellPosition | null = null;
+  private selectionAnchor: CellPosition | null = null;
+  private selectionType: 'cell' | 'column' | 'row' = 'cell';
+  private isMouseDownOnGrid = false;
   private onSelectionChange?: (pos: CellPosition | null) => void;
   private onEditStart?: (initial?: string) => void;
   private onCopy?: (value: string) => void;
@@ -78,16 +101,19 @@ export class SheetRenderer {
   private onViewportChange?: () => void;
   private onColumnResize?: (col: number, width: number) => void;
   private onRowResize?: (row: number, height: number) => void;
+  private onSheetMutated?: () => void;
 
   /** Column resize drag state. */
   private resizingCol = -1;
-  private resizeStartX = 0;
-  private resizeStartWidth = 0;
+  private resizeStartMouseX = 0;
+  private resizeOriginalWidth = 0;
+  private resizeCurrentWidth = 0;
 
   /** Row resize drag state. */
   private resizingRow = -1;
-  private resizeStartY = 0;
-  private resizeStartHeight = 0;
+  private resizeStartMouseY = 0;
+  private resizeOriginalHeight = 0;
+  private resizeCurrentHeight = 0;
 
   private devicePixelRatio: number;
   private boundHandleWheel: (e: WheelEvent) => void;
@@ -119,6 +145,7 @@ export class SheetRenderer {
     this.onViewportChange = config.onViewportChange;
     this.onColumnResize = config.onColumnResize;
     this.onRowResize = config.onRowResize;
+    this.onSheetMutated = config.onSheetMutated;
     this.devicePixelRatio = window.devicePixelRatio || 1;
 
     const ctx = config.canvas.getContext('2d');
@@ -209,9 +236,22 @@ export class SheetRenderer {
     return { ...this.viewport };
   }
 
+  /** Returns the current internal sheet data. */
+  getSheet(): SheetData {
+    return this.sheet;
+  }
+
   /** Returns the currently selected cell position, or null. */
   getSelectedCell(): CellPosition | null {
     return this.selectedCell ? { ...this.selectedCell } : null;
+  }
+
+  /**
+   * Moves the selected cell by the given delta, clamped to sheet bounds.
+   * Used by the parent to navigate after edit commit.
+   */
+  moveSelectedCell(dRow: number, dCol: number): void {
+    this.moveSelection(dRow, dCol);
   }
 
   /**
@@ -285,20 +325,6 @@ export class SheetRenderer {
     const vp = clampViewport(panViewport(this.viewport, -deltaX, -deltaY), this.contentSize);
     this.viewport = vp;
     this.notifyViewportChange();
-  }
-
-  /**
-   * Translates a canvas click into cell coordinates and selects that cell.
-   */
-  private handleClick(e: MouseEvent): void {
-    const rect = this.canvas.getBoundingClientRect();
-    const x = e.clientX - rect.left;
-    const y = e.clientY - rect.top;
-
-    const cellPos = this.pixelToCell(x, y);
-    this.selectedCell = cellPos;
-    this.onSelectionChange?.(cellPos);
-    this.queueRender();
   }
 
   private handleResize(): void {
@@ -436,8 +462,9 @@ export class SheetRenderer {
     const edgeCol = this.detectColumnEdge(x, y);
     if (edgeCol >= 0) {
       this.resizingCol = edgeCol;
-      this.resizeStartX = x;
-      this.resizeStartWidth = getColumnWidth(this.sheet, edgeCol);
+      this.resizeStartMouseX = x;
+      this.resizeOriginalWidth = getColumnWidth(this.sheet, edgeCol);
+      this.resizeCurrentWidth = this.resizeOriginalWidth;
       e.preventDefault();
       return;
     }
@@ -446,8 +473,9 @@ export class SheetRenderer {
     const edgeRow = this.detectRowEdge(x, y);
     if (edgeRow >= 0) {
       this.resizingRow = edgeRow;
-      this.resizeStartY = y;
-      this.resizeStartHeight = getRowHeight(this.sheet, edgeRow);
+      this.resizeStartMouseY = y;
+      this.resizeOriginalHeight = getRowHeight(this.sheet, edgeRow);
+      this.resizeCurrentHeight = this.resizeOriginalHeight;
       e.preventDefault();
       return;
     }
@@ -504,8 +532,45 @@ export class SheetRenderer {
       }
     }
 
-    /* Not a scrollbar click — delegate to cell click. */
-    this.handleClick(e);
+    /* Not a scrollbar click — check corner, headers, then grid. */
+    const cornerClick = this.isInCorner(x, y);
+    if (cornerClick) {
+      /* Click on corner → select all cells. */
+      this.selectionType = 'cell';
+      this.selectedCell = createPosition(0, 0);
+      this.selectionAnchor = createPosition(
+        this.sheet.config.rowCount - 1,
+        this.sheet.config.colCount - 1,
+      );
+      this.isMouseDownOnGrid = true;
+    } else {
+      const colHeaderClick = this.isInColumnHeader(x, y);
+      const rowHeaderClick = this.isInRowHeader(x, y);
+
+      if (colHeaderClick >= 0) {
+        /* Click on column header → select entire column. */
+        this.selectionType = 'column';
+        this.selectedCell = createPosition(0, colHeaderClick);
+        this.selectionAnchor = createPosition(this.sheet.config.rowCount - 1, colHeaderClick);
+        this.isMouseDownOnGrid = true;
+      } else if (rowHeaderClick >= 0) {
+        /* Click on row header → select entire row. */
+        this.selectionType = 'row';
+        this.selectedCell = createPosition(rowHeaderClick, 0);
+        this.selectionAnchor = createPosition(rowHeaderClick, this.sheet.config.colCount - 1);
+        this.isMouseDownOnGrid = true;
+      } else {
+        /* Click on grid → select cell / start range drag. */
+        const cellPos = this.pixelToCell(x, y);
+        this.selectionType = 'cell';
+        this.selectedCell = cellPos;
+        this.selectionAnchor = cellPos;
+        this.isMouseDownOnGrid = cellPos !== null;
+      }
+    }
+
+    this.onSelectionChange?.(this.selectedCell);
+    this.queueRender();
   }
 
   private handleMouseMove(e: MouseEvent): void {
@@ -516,14 +581,10 @@ export class SheetRenderer {
     /* Row resize drag. */
     if (this.resizingRow >= 0) {
       const { zoom } = this.viewport;
-      const delta = (y - this.resizeStartY) / zoom;
-      const newHeight = Math.max(12, this.resizeStartHeight + delta);
-      const rowH = getRowHeight(this.sheet, this.resizingRow);
-      if (Math.abs(newHeight - rowH) > 0.5) {
-        const updated = setRowHeight(this.sheet, this.resizingRow, newHeight);
-        this.sheet = updated;
-        this.recalcContentSize();
-        this.viewport = clampViewport(this.viewport, this.contentSize);
+      const delta = (y - this.resizeStartMouseY) / zoom;
+      const newHeight = Math.max(12, this.resizeOriginalHeight + delta);
+      if (Math.abs(newHeight - this.resizeCurrentHeight) > 0.5) {
+        this.resizeCurrentHeight = newHeight;
         this.queueRender();
       }
       return;
@@ -532,15 +593,10 @@ export class SheetRenderer {
     /* Column resize drag. */
     if (this.resizingCol >= 0) {
       const { zoom } = this.viewport;
-      const delta = (x - this.resizeStartX) / zoom;
-      const newWidth = Math.max(20, this.resizeStartWidth + delta);
-      const colW = getColumnWidth(this.sheet, this.resizingCol);
-      if (Math.abs(newWidth - colW) > 0.5) {
-        /* Update internal sheet without full round-trip. */
-        const updated = setColumnWidth(this.sheet, this.resizingCol, newWidth);
-        this.sheet = updated;
-        this.recalcContentSize();
-        this.viewport = clampViewport(this.viewport, this.contentSize);
+      const delta = (x - this.resizeStartMouseX) / zoom;
+      const newWidth = Math.max(20, this.resizeOriginalWidth + delta);
+      if (Math.abs(newWidth - this.resizeCurrentWidth) > 0.5) {
+        this.resizeCurrentWidth = newWidth;
         this.queueRender();
       }
       return;
@@ -573,6 +629,37 @@ export class SheetRenderer {
       return;
     }
 
+    /* Range selection drag — cell / column / row. */
+    if (this.isMouseDownOnGrid && this.selectionAnchor) {
+      if (this.selectionType === 'cell') {
+        const cellPos = this.pixelToCell(x, y);
+        if (
+          cellPos &&
+          this.selectedCell &&
+          (cellPos.row !== this.selectedCell.row || cellPos.col !== this.selectedCell.col)
+        ) {
+          this.selectedCell = cellPos;
+          this.onSelectionChange?.(cellPos);
+          this.queueRender();
+        }
+      } else if (this.selectionType === 'column') {
+        const col = this.isInColumnHeader(x, y);
+        if (col >= 0 && col !== this.selectedCell?.col) {
+          this.selectedCell = createPosition(this.selectedCell?.row ?? 0, col);
+          this.onSelectionChange?.(this.selectedCell);
+          this.queueRender();
+        }
+      } else {
+        const row = this.isInRowHeader(x, y);
+        if (row >= 0 && row !== this.selectedCell?.row) {
+          this.selectedCell = createPosition(row, this.selectedCell?.col ?? 0);
+          this.onSelectionChange?.(this.selectedCell);
+          this.queueRender();
+        }
+      }
+      return;
+    }
+
     /* Update cursor for column/row edge hover. */
     const edgeCol = this.detectColumnEdge(x, y);
     const edgeRow = this.detectRowEdge(x, y);
@@ -587,17 +674,47 @@ export class SheetRenderer {
 
   private handleMouseUp(_e: MouseEvent): void {
     if (this.resizingCol >= 0) {
-      const newWidth = getColumnWidth(this.sheet, this.resizingCol);
+      const newWidth = this.resizeCurrentWidth;
+      const cols = this.getColumnSelectionRange();
+      /* Apply to the directly dragged column first, then batch to others. */
+      let sheet = setColumnWidth(this.sheet, this.resizingCol, newWidth);
+      if (cols.length > 1) {
+        for (const c of cols) {
+          if (c !== this.resizingCol) {
+            sheet = setColumnWidth(sheet, c, newWidth);
+          }
+        }
+      }
+      this.sheet = sheet;
+      this.recalcContentSize();
+      this.viewport = clampViewport(this.viewport, this.contentSize);
       this.onColumnResize?.(this.resizingCol, newWidth);
+      if (cols.length > 1) this.onSheetMutated?.();
       this.resizingCol = -1;
       this.canvas.style.cursor = '';
+      this.queueRender();
     }
     if (this.resizingRow >= 0) {
-      const newHeight = getRowHeight(this.sheet, this.resizingRow);
+      const newHeight = this.resizeCurrentHeight;
+      const rows = this.getRowSelectionRange();
+      let sheet = setRowHeight(this.sheet, this.resizingRow, newHeight);
+      if (rows.length > 1) {
+        for (const r of rows) {
+          if (r !== this.resizingRow) {
+            sheet = setRowHeight(sheet, r, newHeight);
+          }
+        }
+      }
+      this.sheet = sheet;
+      this.recalcContentSize();
+      this.viewport = clampViewport(this.viewport, this.contentSize);
       this.onRowResize?.(this.resizingRow, newHeight);
+      if (rows.length > 1) this.onSheetMutated?.();
       this.resizingRow = -1;
       this.canvas.style.cursor = '';
+      this.queueRender();
     }
+    this.isMouseDownOnGrid = false;
     this.scrollbarDrag = null;
   }
 
@@ -692,6 +809,93 @@ export class SheetRenderer {
       }
     }
     return -1;
+  }
+
+  /**
+   * Returns the column index if canvas (x,y) falls inside a column header, else -1.
+   */
+  private isInColumnHeader(canvasX: number, canvasY: number): number {
+    const { zoom, scrollX } = this.viewport;
+    const { headerRowHeight, colCount } = this.sheet.config;
+    if (canvasY < 0 || canvasY > headerRowHeight * zoom) return -1;
+    const worldX = (canvasX - scrollX) / zoom;
+    for (let c = 0; c < colCount; c++) {
+      const left = this.getColumnX(c);
+      const right = left + getColumnWidth(this.sheet, c);
+      if (worldX >= left && worldX < right) return c;
+    }
+    return -1;
+  }
+
+  /**
+   * Returns the row index if canvas (x,y) falls inside a row header, else -1.
+   */
+  private isInRowHeader(canvasX: number, canvasY: number): number {
+    const { zoom, scrollY } = this.viewport;
+    const { headerColWidth, rowCount } = this.sheet.config;
+    if (canvasX < 0 || canvasX > headerColWidth * zoom) return -1;
+    const worldY = (canvasY - scrollY) / zoom;
+    for (let r = 0; r < rowCount; r++) {
+      const top = this.getRowY(r);
+      const bottom = top + getRowHeight(this.sheet, r);
+      if (worldY >= top && worldY < bottom) return r;
+    }
+    return -1;
+  }
+
+  /** Returns array of column indices in the current selection. */
+  private getColumnSelectionRange(): Array<number> {
+    if (!this.selectionAnchor || !this.selectedCell) return [this.resizingCol];
+    const rng = normalizeRange(
+      this.selectionAnchor.row,
+      this.selectionAnchor.col,
+      this.selectedCell.row,
+      this.selectedCell.col,
+    );
+    /* Return full range if either: column-type selection OR range covers all columns. */
+    const spansAllCols = rng.startCol === 0 && rng.endCol === this.sheet.config.colCount - 1;
+    if (this.selectionType === 'column' || spansAllCols) {
+      const cols: Array<number> = [];
+      for (let c = rng.startCol; c <= rng.endCol; c++) {
+        cols.push(c);
+      }
+      return cols.length > 0 ? cols : [this.resizingCol];
+    }
+    return [this.resizingCol];
+  }
+
+  /** Returns array of row indices in the current selection. */
+  private getRowSelectionRange(): Array<number> {
+    if (!this.selectionAnchor || !this.selectedCell) return [this.resizingRow];
+    const rng = normalizeRange(
+      this.selectionAnchor.row,
+      this.selectionAnchor.col,
+      this.selectedCell.row,
+      this.selectedCell.col,
+    );
+    const spansAllRows = rng.startRow === 0 && rng.endRow === this.sheet.config.rowCount - 1;
+    if (this.selectionType === 'row' || spansAllRows) {
+      const rows: Array<number> = [];
+      for (let r = rng.startRow; r <= rng.endRow; r++) {
+        rows.push(r);
+      }
+      return rows.length > 0 ? rows : [this.resizingRow];
+    }
+    return [this.resizingRow];
+  }
+
+  /**
+   * Returns true if canvas (x,y) falls inside the corner cell (top-left header intersection).
+   */
+  private isInCorner(canvasX: number, canvasY: number): boolean {
+    const { zoom } = this.viewport;
+    const { headerColWidth, headerRowHeight } = this.sheet.config;
+    return (
+      canvasX >= 0 &&
+      canvasX <= headerColWidth * zoom &&
+      canvasY >= 0 &&
+      canvasY <= headerRowHeight * zoom
+    );
   }
 
   /* ------------------------------------------------------------------ */
@@ -833,8 +1037,8 @@ export class SheetRenderer {
     ctx.translate(scrollX, scrollY);
     ctx.scale(zoom, zoom);
     this.renderDataBg();
-    this.renderGridLines();
     this.renderSelection();
+    this.renderGridLines();
     this.renderCells();
     ctx.restore();
 
@@ -858,7 +1062,10 @@ export class SheetRenderer {
     this.renderCorner();
     ctx.restore();
 
-    /* 5. Scrollbars — screen space, always on top. */
+    /* 5. Resize guide line — screen space. */
+    this.renderResizeGuide();
+
+    /* 6. Scrollbars — screen space, always on top. */
     this.renderScrollbars();
   }
 
@@ -880,12 +1087,20 @@ export class SheetRenderer {
     ctx.fillStyle = theme.headerBg;
     ctx.fillRect(headerColWidth, 0, totalW - headerColWidth, headerRowHeight);
 
-    /* Highlight selected column header. */
-    if (this.selectedCell) {
-      const selX = this.getColumnX(this.selectedCell.col);
-      const selW = getColumnWidth(this.sheet, this.selectedCell.col);
+    /* Highlight selected column headers (all columns in range). */
+    if (this.selectedCell && this.selectionAnchor) {
+      const rng = normalizeRange(
+        this.selectionAnchor.row,
+        this.selectionAnchor.col,
+        this.selectedCell.row,
+        this.selectedCell.col,
+      );
       ctx.fillStyle = theme.headerSelectedBg;
-      ctx.fillRect(selX, 0, selW, headerRowHeight);
+      for (let c = rng.startCol; c <= rng.endCol; c++) {
+        const hx = this.getColumnX(c);
+        const hw = getColumnWidth(this.sheet, c);
+        ctx.fillRect(hx, 0, hw, headerRowHeight);
+      }
     }
 
     ctx.font = `${theme.headerFontSize}px ${theme.fontFamily}`;
@@ -928,12 +1143,20 @@ export class SheetRenderer {
     ctx.fillStyle = theme.headerBg;
     ctx.fillRect(0, headerRowHeight, headerColWidth, totalH - headerRowHeight);
 
-    /* Highlight selected row header. */
-    if (this.selectedCell) {
-      const selY = this.getRowY(this.selectedCell.row);
-      const selH = getRowHeight(this.sheet, this.selectedCell.row);
+    /* Highlight selected row headers (all rows in range). */
+    if (this.selectedCell && this.selectionAnchor) {
+      const rng = normalizeRange(
+        this.selectionAnchor.row,
+        this.selectionAnchor.col,
+        this.selectedCell.row,
+        this.selectedCell.col,
+      );
       ctx.fillStyle = theme.headerSelectedBg;
-      ctx.fillRect(0, selY, headerColWidth, selH);
+      for (let r = rng.startRow; r <= rng.endRow; r++) {
+        const hy = this.getRowY(r);
+        const hh = getRowHeight(this.sheet, r);
+        ctx.fillRect(0, hy, headerColWidth, hh);
+      }
     }
 
     ctx.font = `${theme.headerFontSize}px ${theme.fontFamily}`;
@@ -973,9 +1196,18 @@ export class SheetRenderer {
     ctx.fillStyle = theme.cornerBg;
     ctx.fillRect(0, 0, headerColWidth, headerRowHeight);
 
-    ctx.strokeStyle = theme.gridLine;
-    ctx.lineWidth = 1 / this.viewport.zoom;
-    ctx.strokeRect(0, 0, headerColWidth, headerRowHeight);
+    /* Solid triangle pointing ↘, centered in the corner cell. */
+    const size = 10;
+    const cx = headerColWidth / 2;
+    const cy = headerRowHeight / 2;
+    const r = size / 2;
+    ctx.fillStyle = '#9aa0a6';
+    ctx.beginPath();
+    ctx.moveTo(cx + r, cy - r);
+    ctx.lineTo(cx + r, cy + r);
+    ctx.lineTo(cx - r, cy + r);
+    ctx.closePath();
+    ctx.fill();
   }
 
   /* ------------------------------------------------------------------ */
@@ -1079,8 +1311,17 @@ export class SheetRenderer {
         ctx.rect(x, y, colW, rowH);
         ctx.clip();
 
-        const display = cell.displayValue ?? String(cell.value);
-        ctx.fillText(display, textX, y + rowH / 2);
+        const text = cell.displayValue ?? String(cell.value);
+        const lines = text.split('\n');
+        const lineHeight = theme.cellFontSize * 1.4;
+        const firstLineY = y + padding + theme.cellFontSize * 0.7;
+
+        ctx.textBaseline = 'alphabetic';
+        for (let li = 0; li < lines.length; li++) {
+          const lineY = firstLineY + li * lineHeight;
+          if (lineY > y + rowH) break; // stop if beyond cell bounds
+          ctx.fillText(lines[li] ?? '', textX, lineY);
+        }
         ctx.restore();
       }
     }
@@ -1091,27 +1332,127 @@ export class SheetRenderer {
   /* ------------------------------------------------------------------ */
 
   private renderSelection(): void {
-    if (!this.selectedCell) return;
+    if (!this.selectedCell || !this.selectionAnchor) return;
 
     const { ctx, theme } = this;
     const { row, col } = this.selectedCell;
-    const { rowCount, colCount } = this.sheet.config;
 
-    if (row >= rowCount || col >= colCount) return;
+    if (this.selectionType === 'column') {
+      const rng = normalizeRange(this.selectionAnchor.row, this.selectionAnchor.col, row, col);
+      const y0 = this.getRowY(0);
+      const h = this.getTotalHeight() - this.sheet.config.headerRowHeight;
 
-    const x = this.getColumnX(col);
-    const y = this.getRowY(row);
-    const colW = getColumnWidth(this.sheet, col);
-    const rowH = getRowHeight(this.sheet, row);
+      /* Fill all columns in the range. */
+      ctx.fillStyle = theme.selectionBg;
+      for (let c = rng.startCol; c <= rng.endCol; c++) {
+        const cx = this.getColumnX(c);
+        const cw = getColumnWidth(this.sheet, c);
+        ctx.fillRect(cx, y0, cw, h);
+      }
 
-    // Fill
+      /* Single border around the entire range. */
+      const rangeX = this.getColumnX(rng.startCol);
+      const rangeW = this.getColumnX(rng.endCol) + getColumnWidth(this.sheet, rng.endCol) - rangeX;
+      ctx.strokeStyle = theme.selectionBorder;
+      ctx.lineWidth = 2 / this.viewport.zoom;
+      ctx.strokeRect(rangeX, y0, rangeW, h);
+      return;
+    }
+
+    if (this.selectionType === 'row') {
+      const rng = normalizeRange(this.selectionAnchor.row, this.selectionAnchor.col, row, col);
+      const x0 = this.getColumnX(0);
+      const w = this.getTotalWidth() - this.sheet.config.headerColWidth;
+
+      /* Fill all rows in the range. */
+      ctx.fillStyle = theme.selectionBg;
+      for (let r = rng.startRow; r <= rng.endRow; r++) {
+        const ry = this.getRowY(r);
+        const rh = getRowHeight(this.sheet, r);
+        ctx.fillRect(x0, ry, w, rh);
+      }
+
+      /* Single border around the entire range. */
+      const rangeY = this.getRowY(rng.startRow);
+      const rangeH = this.getRowY(rng.endRow) + getRowHeight(this.sheet, rng.endRow) - rangeY;
+      ctx.strokeStyle = theme.selectionBorder;
+      ctx.lineWidth = 2 / this.viewport.zoom;
+      ctx.strokeRect(x0, rangeY, w, rangeH);
+      return;
+    }
+
+    /* Range / single cell selection. */
+    const rng = normalizeRange(this.selectionAnchor.row, this.selectionAnchor.col, row, col);
+
+    const rngX = this.getColumnX(rng.startCol);
+    const rngY = this.getRowY(rng.startRow);
+    const rngW = this.getColumnX(rng.endCol) + getColumnWidth(this.sheet, rng.endCol) - rngX;
+    const rngH = this.getRowY(rng.endRow) + getRowHeight(this.sheet, rng.endRow) - rngY;
+
+    /* Fill the range. */
     ctx.fillStyle = theme.selectionBg;
-    ctx.fillRect(x, y, colW, rowH);
+    ctx.fillRect(rngX, rngY, rngW, rngH);
 
-    // Border
+    /* Draw the active cell in white with a blue border. */
+    const activeX = this.getColumnX(col);
+    const activeY = this.getRowY(row);
+    const activeW = getColumnWidth(this.sheet, col);
+    const activeH = getRowHeight(this.sheet, row);
+
+    ctx.fillStyle = '#ffffff';
+    ctx.fillRect(activeX, activeY, activeW, activeH);
+
+    /* Border around the entire range. */
     ctx.strokeStyle = theme.selectionBorder;
     ctx.lineWidth = 2 / this.viewport.zoom;
-    ctx.strokeRect(x, y, colW, rowH);
+    ctx.strokeRect(rngX, rngY, rngW, rngH);
+
+    /* Border around the active cell. */
+    ctx.strokeStyle = theme.selectionBorder;
+    ctx.lineWidth = 2 / this.viewport.zoom;
+    ctx.strokeRect(activeX, activeY, activeW, activeH);
+  }
+
+  /* ------------------------------------------------------------------ */
+  /*  Resize Guide Line                                                  */
+  /* ------------------------------------------------------------------ */
+
+  /** Draws a dashed guide line during column/row resize. */
+  private renderResizeGuide(): void {
+    const { ctx, theme } = this;
+    const { zoom, scrollX, scrollY } = this.viewport;
+    const totalW = this.getTotalWidth();
+    const totalH = this.getTotalHeight();
+
+    ctx.save();
+    ctx.setLineDash([4, 4]);
+    ctx.strokeStyle = theme.selectionBorder;
+    ctx.lineWidth = 1;
+
+    if (this.resizingCol >= 0) {
+      /* Use the drag state width, not current sheet width (sheet unchanged during drag). */
+      const colRight = this.getColumnX(this.resizingCol) + this.resizeCurrentWidth;
+      const x = colRight * zoom + scrollX;
+      const y0 = 0;
+      const y1 = totalH * zoom + scrollY;
+      ctx.beginPath();
+      ctx.moveTo(x, y0);
+      ctx.lineTo(x, y1);
+      ctx.stroke();
+    }
+
+    if (this.resizingRow >= 0) {
+      const rowBottom = this.getRowY(this.resizingRow) + this.resizeCurrentHeight;
+      const y = rowBottom * zoom + scrollY;
+      const x0 = 0;
+      const x1 = totalW * zoom + scrollX;
+      ctx.beginPath();
+      ctx.moveTo(x0, y);
+      ctx.lineTo(x1, y);
+      ctx.stroke();
+    }
+
+    ctx.restore();
   }
 
   /* ------------------------------------------------------------------ */
