@@ -443,3 +443,52 @@ const v = config.field ?? defaultValue;
 ### File ignores
 
 Config files (`vite.config.ts`, `.vitepress/config.ts`) are ignored by ESLint. They don't need to follow project rules.
+
+---
+
+## Git Commit Conventions
+
+Follow [Conventional Commits](https://www.conventionalcommits.org/).
+
+### Format
+
+```
+<type>: <简短描述>
+
+- 具体改动 1
+- 具体改动 2
+```
+
+中文描述，`<type>` 使用英文。
+
+### Types
+
+| Type       | 用途               |
+| ---------- | ------------------ |
+| `feat`     | 新功能             |
+| `fix`      | Bug 修复           |
+| `refactor` | 重构（不改变功能） |
+| `style`    | 格式/样式调整      |
+| `docs`     | 文档               |
+| `test`     | 测试               |
+| `chore`    | 构建/工具/CI       |
+
+### 示例
+
+```
+feat: 框选/多选/批量调整 + 回车换行 + 角格全选
+
+- 鼠标拖拽框选单元格范围
+- 点击列头/行头选中整列/整行
+- 拖拽批量调整列宽行高
+- Enter 提交并下移，Shift+Enter 换行
+```
+
+### 规则
+
+- 标题以 `type:` 开头，50 字符以内
+- 标题用中文描述主要改动
+- 正文用 `-` 列出具体改动点
+- 结尾必须有 `Co-Authored-By: Claude Opus 4.7 <noreply@anthropic.com>`
+- 提交前确保 `pnpm build` 和 `pnpm lint` 通过
+- 不提交 `node_modules`、`dist`、`.turbo`
