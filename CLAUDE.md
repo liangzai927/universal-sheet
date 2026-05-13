@@ -1,6 +1,7 @@
 # CLAUDE.md
 
 ## Project: Universal Sheet
+
 Excel-like frontend spreadsheet SDK. Framework-agnostic core, publishable to npm, supports Vue 3 and React. Features developed incrementally layer by layer: core → engine → UI.
 
 ---
@@ -27,46 +28,52 @@ function getCell(row: number, col: number): CellData | null { ... }
 
 ### Naming
 
-| Category | Convention | Example |
-|----------|-----------|---------|
-| Interface | PascalCase, no `I` prefix | `CellData`, `SheetConfig` |
-| Type alias | PascalCase | `CellValue = string \| number` |
-| Enum member | PascalCase | `CellType.Text` |
-| Variable/function | camelCase | `getCellValue`, `rowIndex` |
-| Constant | UPPER_SNAKE_CASE | `MAX_ROWS`, `DEFAULT_COL_WIDTH` |
-| Private members | camelCase, no `_` prefix | `internalState` (use `private` keyword) |
-| File name | kebab-case | `cell-model.ts`, `sheet-engine.ts` |
+| Category          | Convention                | Example                                 |
+| ----------------- | ------------------------- | --------------------------------------- |
+| Interface         | PascalCase, no `I` prefix | `CellData`, `SheetConfig`               |
+| Type alias        | PascalCase                | `CellValue = string \| number`          |
+| Enum member       | PascalCase                | `CellType.Text`                         |
+| Variable/function | camelCase                 | `getCellValue`, `rowIndex`              |
+| Constant          | UPPER_SNAKE_CASE          | `MAX_ROWS`, `DEFAULT_COL_WIDTH`         |
+| Private members   | camelCase, no `_` prefix  | `internalState` (use `private` keyword) |
+| File name         | kebab-case                | `cell-model.ts`, `sheet-engine.ts`      |
 
 ---
 
 ## Package Architecture Constraints
 
 ### `packages/core` — Pure logic, zero DOM
+
 - **Forbidden**: `document`, `window`, `HTMLElement`, Vue/React imports
 - **Allowed**: Pure TS data structures, algorithms, event emitters
 - **Dependencies**: Only `@universal-sheet/shared`
 
 ### `packages/engine` — Canvas rendering, no framework code
+
 - **Forbidden**: Vue/React imports, direct DOM manipulation for UI
 - **Allowed**: Canvas 2D API, `OffscreenCanvas`, requestAnimationFrame
 - **Dependencies**: `@universal-sheet/core`, `@universal-sheet/shared`
 
 ### `packages/formula` — Formula parsing, pure computation
+
 - **Forbidden**: DOM, framework imports, side effects
 - **Allowed**: Parser combinators, AST manipulation, decimal arithmetic
 - **Dependencies**: `@universal-sheet/shared` only
 
 ### `packages/shared` — Internal utilities only
+
 - **Never imported by external consumers** (not in npm exports)
 - Small utils: debounce, throttle, event emitter, type guards
 
 ### `packages/ui-vue` — Vue 3 bindings
+
 - Vue 3 Composition API only (no Options API)
 - `<script setup lang="ts">` required
 - `defineProps<T>()` with interface, `defineEmits<T>()` with type
 - No direct DOM queries — use `ref`/`template ref`
 
 ### `packages/ui-react` — React bindings
+
 - Function components only, no class components
 - Hooks for all state/logic
 - `React.memo` on pure presentational components
@@ -111,6 +118,7 @@ export default Vue.extend({
 ```
 
 ### Vue 2 constraints
+
 - Use `Vue.extend()` for type-safe component definitions
 - `v-model` uses `modelValue` prop + `input` event (standard Vue 2 model)
 - Props: declare types via constructor (`String`, `Number`, `Boolean`, `Object`, `Array`)
@@ -150,6 +158,7 @@ const emit = defineEmits<Emits>();
 ```
 
 ### Vue constraints
+
 - CSS class prefix: `us-` (universal-sheet)
 - Scoped styles via `<style scoped>` or CSS modules
 - No inline styles over 2 properties — extract to class
@@ -181,15 +190,12 @@ export const SheetView = memo(function SheetView({ data, onCellClick }: SheetVie
     [onCellClick],
   );
 
-  return (
-    <div className="us-sheet-view">
-      {/* JSX content */}
-    </div>
-  );
+  return <div className="us-sheet-view">{/* JSX content */}</div>;
 });
 ```
 
 ### React constraints
+
 - CSS class prefix: `us-`
 - Named exports only (no default exports)
 - `memo()` on components that receive props from parent
@@ -201,23 +207,39 @@ export const SheetView = memo(function SheetView({ data, onCellClick }: SheetVie
 
 ## Comment Standards
 
-### When to write comments
-- **Public API**: Every exported function/class/interface must have a JSDoc comment
-- **Non-obvious logic**: Algorithm choice, performance consideration, edge case handling
-- **Why, not what**: Explain the reason behind a decision, not what the code does
+### JSDoc for every function (exported or internal)
+
+Every function must have a JSDoc block describing **what it does**, its **parameters**, and its **return value**.
 
 ```ts
 /**
  * Parses a formula string into an AST.
  * Uses recursive descent rather than regex to handle nested function calls.
+ *
+ * @param input - Raw formula string (e.g. "=SUM(A1, B1)")
+ * @returns The root node of the parsed AST
+ * @throws {FormulaError} If input is empty or malformed
  */
 export function parseFormula(input: string): FormulaNode { ... }
+```
 
+- `@param` — every parameter documented with type and purpose
+- `@returns` — return value described (omit only for `void`)
+- `@throws` — documented if the function can throw
+- Internal helper functions follow the same rule — no exceptions
+
+### When to write inline comments
+
+- **Non-obvious logic**: Algorithm choice, performance consideration, edge case handling
+- **Why, not what**: Explain the reason behind a decision, not what the code does
+
+```ts
 // Recalculate only dirty cells to avoid O(n²) on large sheets
 for (const cell of dirtyCells) { ... }
 ```
 
 ### When NOT to write comments
+
 - Self-documenting code: `getCellValue(row, col)` needs no comment
 - Variable declarations with clear names
 - Simple getters/setters
@@ -229,17 +251,20 @@ for (const cell of dirtyCells) { ... }
 ### Framework: Vitest
 
 ### File location
+
 ```
 packages/core/src/cell-model.ts
 packages/core/src/__tests__/cell-model.test.ts
 ```
 
 ### Naming
+
 - Test file: `{module-name}.test.ts`
 - Describe block: the module/function name
 - Test case: `should {expected behavior} when {condition}`
 
 ### Template
+
 ```ts
 import { describe, it, expect } from 'vitest';
 import { parseFormula } from '../formula-parser';
@@ -267,6 +292,7 @@ describe('parseFormula', () => {
 ```
 
 ### Test constraints
+
 - **Coverage target**: 80%+ on core/engine/formula, 60%+ on UI packages
 - **No test nesting** beyond `describe` → `it` (no nested describes)
 - **One assertion context per test**: test one behavior per `it` block
@@ -275,6 +301,38 @@ describe('parseFormula', () => {
 - **Data factories**: Extract repeated test data setup into `test-utils.ts` files
 - **No snapshot tests** — prefer explicit `toEqual`/`toMatchObject` assertions
 - **Edge cases required** per public function: empty input, boundary values, error paths
+
+---
+
+## Modularization
+
+- **Strict ES module**: `import`/`export` only, no `require()`, no `module.exports`
+- **One responsibility per file**: if a file exceeds 300 lines, split it
+- **No barrel re-export chains**: `index.ts` only re-exports from siblings, never re-exports another barrel
+- **Import order**: external packages → `@universal-sheet/` internal → relative imports
+- **No side-effect imports**: every import must bind a value or type (exception: `import 'vitest'` in test files)
+- **No circular dependencies**: if two modules need each other, extract a shared interface to `shared/`
+
+### Encapsulation
+
+- **Extract reusable logic**: any utility used ≥ 2 times becomes a named function in the appropriate module
+- **Pure functions over methods**: prefer `function doThing(data: Data): Result` over class methods when no instance state is required
+- **No magic numbers/strings**: extract to named constants at module top
+- **Parameter limit**: functions with > 4 params should accept an options object
+
+```ts
+// BAD: inline magic, non-reusable
+const total = price * 1.13 + 5;
+// BAD: too many positional params
+function drawCell(x: number, y: number, w: number, h: number, color: string, text: string): void { ... }
+
+// GOOD: extracted constant + function
+const TAX_RATE = 0.13;
+const SHIPPING_FLAT = 5;
+function calculateTotal(price: number): number { return price * (1 + TAX_RATE) + SHIPPING_FLAT; }
+// GOOD: options object
+function drawCell(pos: CellPos, size: CellSize, style: CellStyle): void { ... }
+```
 
 ---
 

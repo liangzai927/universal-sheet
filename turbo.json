@@ -21,6 +21,10 @@
     },
     "docs:build": {
       "outputs": ["dist/**", ".vitepress/dist/**"]
+    },
+    "typecheck": {},
+    "clean": {
+      "cache": false
     }
   }
 }
