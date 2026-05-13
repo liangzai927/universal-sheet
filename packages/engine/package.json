@@ -17,5 +17,8 @@
     "dev": "tsc --watch",
     "lint": "eslint src/",
     "test": "vitest run"
+  },
+  "dependencies": {
+    "@universal-sheet/core": "workspace:*"
   }
 }

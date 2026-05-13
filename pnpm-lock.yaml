@@ -87,7 +87,11 @@ importers:
 
   packages/core: {}
 
-  packages/engine: {}
+  packages/engine:
+    dependencies:
+      '@universal-sheet/core':
+        specifier: workspace:*
+        version: link:../core
 
   packages/formula: {}
 

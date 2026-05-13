@@ -1,4 +1,22 @@
-// @universal-sheet/core - Framework-agnostic core logic
-// No DOM or framework dependencies allowed in this package.
+// @universal-sheet/core — Pure TypeScript data structures and algorithms.
+// Zero DOM or framework dependencies.
 
-export const VERSION = '1.0.0';
+export {
+  createSheetConfig,
+  createSheetData,
+  getCellData,
+  getColumnWidth,
+  getRowHeight,
+  setCellValue,
+} from './sheet-model';
+export type {
+  CellData,
+  CellPosition,
+  CellStyle,
+  CellValue,
+  ColumnData,
+  RowData,
+  SheetConfig,
+  SheetData,
+} from './types';
+export { cellKey, createPosition } from './types';
