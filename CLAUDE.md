@@ -344,3 +344,102 @@ function drawCell(pos: CellPos, size: CellSize, style: CellStyle): void { ... }
 - No backwards-compatibility shims or feature flags
 - No `export default` — always named exports
 - Imports: external packages first, then internal `@universal-sheet/` packages, then relative
+
+---
+
+## ESLint / Pre-commit Rules
+
+The pre-commit hook runs `eslint --fix` + `prettier --write`. Code that doesn't pass will block the commit. Follow these rules proactively.
+
+### Import sorting (`simple-import-sort`)
+
+```ts
+// BAD — unsorted imports
+import { SheetRenderer } from '@universal-sheet/engine';
+import { useState } from 'react';
+import type { CellPosition } from '@universal-sheet/core';
+
+// GOOD — externals first (react), then @universal-sheet/*, then relative
+import { useState } from 'react';
+import type { CellPosition } from '@universal-sheet/core';
+import { SheetRenderer } from '@universal-sheet/engine';
+```
+
+- External npm packages first
+- `@universal-sheet/*` second
+- Relative imports (`./`, `../`) last
+- Type-only imports (`import type`) sorted within each group
+
+### Prefer `const` over `let`
+
+```ts
+// BAD
+let result = computeValue();
+
+// GOOD
+const result = computeValue();
+```
+
+Only use `let` when the variable is **actually reassigned**.
+
+### Type-only imports (`@typescript-eslint/consistent-type-imports`)
+
+```ts
+// BAD
+import { CellPosition, SheetData, createSheetData } from '@universal-sheet/core';
+
+// GOOD
+import type { CellPosition, SheetData } from '@universal-sheet/core';
+import { createSheetData } from '@universal-sheet/core';
+```
+
+Use `import type` for types, separate from runtime imports.
+
+### Unused variables (`@typescript-eslint/no-unused-vars`)
+
+No unused imports or variables. After refactoring, remove imports that are no longer needed. Prefix intentional unused args with `_`.
+
+### Prefer optional chain (`@typescript-eslint/prefer-optional-chain`)
+
+```ts
+// BAD
+if (!obj || obj.value === null) continue;
+
+// GOOD
+if (obj?.value == null) continue;
+```
+
+### Array types (`@typescript-eslint/array-type`)
+
+```ts
+// BAD
+function foo(): string[] {}
+
+// GOOD
+function foo(): Array<string> {}
+```
+
+Use `Array<T>` not `T[]`.
+
+### Restrict template expressions (`@typescript-eslint/restrict-template-expressions`)
+
+```ts
+// BAD — boolean/object in template
+`cell: ${cell}`
+// GOOD — number is allowed; anything else must be coerce
+`cell: ${String(cell)}`;
+```
+
+### No non-null assertions (`@typescript-eslint/no-non-null-assertion`)
+
+```ts
+// BAD (warning)
+const v = config.field!;
+
+// GOOD — narrow with type guard or use ?? fallback
+const v = config.field ?? defaultValue;
+```
+
+### File ignores
+
+Config files (`vite.config.ts`, `.vitepress/config.ts`) are ignored by ESLint. They don't need to follow project rules.

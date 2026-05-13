@@ -1,4 +1,5 @@
-import type { CellPosition } from '@universal-sheet/core';
+import type { CellPosition, SheetData } from '@universal-sheet/core';
+import { createSheetData, getCellData, setCellValue } from '@universal-sheet/core';
 import type { SheetRenderer } from '@universal-sheet/engine';
 import { useCallback, useRef, useState } from 'react';
 
@@ -15,15 +16,27 @@ function columnLabel(col: number): string {
   return label;
 }
 
-/**
- * Root app: toolbar placeholder at top, sheet canvas filling the rest.
- * Zoom is driven by Ctrl/Cmd+wheel on the canvas, with +/- buttons in the toolbar
- * for convenience.
- */
+/** Returns "A1"-style label for a cell position. */
+function cellLabel(pos: CellPosition): string {
+  return columnLabel(pos.col) + String(pos.row + 1);
+}
+
 export default function App() {
   const rendererRef = useRef<SheetRenderer | null>(null);
   const [zoom, setZoom] = useState(100);
   const [selectedCell, setSelectedCell] = useState('-');
+  const [selectedPos, setSelectedPos] = useState<CellPosition | null>(null);
+  const [formulaValue, setFormulaValue] = useState('');
+  const [sheetData, setSheetData] = useState<SheetData>(createSheetData());
+
+  /* Refs to keep latest values in closure-sensitive callbacks. */
+  const selectedPosRef = useRef(selectedPos);
+  selectedPosRef.current = selectedPos;
+  const sheetDataRef = useRef(sheetData);
+  sheetDataRef.current = sheetData;
+  const formulaProgramRef = useRef(false);
+
+  /* ---- Renderer callbacks ---- */
 
   const handleReady = useCallback((renderer: SheetRenderer) => {
     rendererRef.current = renderer;
@@ -32,25 +45,42 @@ export default function App() {
 
   const handleSelectionChange = useCallback((pos: CellPosition | null) => {
     if (pos) {
-      setSelectedCell(columnLabel(pos.col) + String(pos.row + 1));
+      setSelectedCell(cellLabel(pos));
+      setSelectedPos(pos);
+      const cell = getCellData(sheetDataRef.current, pos.row, pos.col);
+      formulaProgramRef.current = true;
+      setFormulaValue(cell?.value != null ? String(cell.value) : '');
     } else {
       setSelectedCell('-');
+      setSelectedPos(null);
+      formulaProgramRef.current = true;
+      setFormulaValue('');
     }
   }, []);
+
+  const handleCellChange = useCallback((_updated: SheetData, pos: CellPosition, _value: string) => {
+    sheetDataRef.current = _updated;
+    setSheetData(_updated);
+    if (selectedPosRef.current?.row === pos.row && selectedPosRef.current.col === pos.col) {
+      const cell = getCellData(_updated, pos.row, pos.col);
+      formulaProgramRef.current = true;
+      setFormulaValue(cell?.value != null ? String(cell.value) : '');
+    }
+  }, []);
+
+  /* ---- Zoom controls ---- */
 
   const handleZoomIn = () => {
     const r = rendererRef.current;
     if (!r) return;
-    const newZoom = Math.round(r.getViewport().zoom * 1.15 * 100);
-    r.zoomTo(newZoom / 100);
+    r.zoomTo(r.getViewport().zoom * 1.15);
     setZoom(r.getZoomPercent());
   };
 
   const handleZoomOut = () => {
     const r = rendererRef.current;
     if (!r) return;
-    const newZoom = Math.round((r.getViewport().zoom / 1.15) * 100);
-    r.zoomTo(newZoom / 100);
+    r.zoomTo(r.getViewport().zoom / 1.15);
     setZoom(r.getZoomPercent());
   };
 
@@ -60,6 +90,22 @@ export default function App() {
     r.zoomTo(1);
     setZoom(100);
   };
+
+  /* ---- Formula bar edit ---- */
+
+  const handleFormulaChange = useCallback((value: string) => {
+    setFormulaValue(value);
+    if (formulaProgramRef.current) {
+      formulaProgramRef.current = false;
+      return;
+    }
+    const pos = selectedPosRef.current;
+    if (pos && rendererRef.current) {
+      const updated = setCellValue(sheetDataRef.current, pos.row, pos.col, value);
+      setSheetData(updated);
+      rendererRef.current.updateSheet(updated);
+    }
+  }, []);
 
   return (
     <div style={{ display: 'flex', flexDirection: 'column', height: '100vh' }}>
@@ -75,10 +121,8 @@ export default function App() {
           flexShrink: 0,
         }}
       >
-        {/* Brand */}
         <span style={{ fontWeight: 700, fontSize: 16, marginRight: 16 }}>Universal Sheet</span>
 
-        {/* Placeholder buttons for future toolbar features */}
         <ToolbarButtonGroup label="File">
           <ToolbarButton disabled>New</ToolbarButton>
           <ToolbarButton disabled>Open</ToolbarButton>
@@ -100,7 +144,6 @@ export default function App() {
           <ToolbarButton disabled>U</ToolbarButton>
         </ToolbarButtonGroup>
 
-        {/* Spacer */}
         <div style={{ flex: 1 }} />
 
         {/* Selected cell indicator */}
@@ -121,7 +164,6 @@ export default function App() {
 
         <ToolbarDivider />
 
-        {/* Zoom controls */}
         <div style={{ display: 'flex', alignItems: 'center', gap: 4 }}>
           <ZoomButton onClick={handleZoomOut} label="-" />
           <span
@@ -141,9 +183,59 @@ export default function App() {
         </div>
       </div>
 
+      {/* ---- Formula Bar ---- */}
+      <div
+        style={{
+          display: 'flex',
+          alignItems: 'center',
+          gap: 6,
+          padding: '4px 16px',
+          borderBottom: '1px solid #d4d4d4',
+          background: '#fff',
+          flexShrink: 0,
+        }}
+      >
+        {/* Cell reference */}
+        <span
+          style={{
+            minWidth: 54,
+            textAlign: 'center',
+            fontSize: 13,
+            fontWeight: 600,
+            color: '#1a1a1a',
+            borderRight: '1px solid #d4d4d4',
+            paddingRight: 8,
+          }}
+        >
+          {selectedCell}
+        </span>
+        {/* Content input */}
+        <input
+          value={formulaValue}
+          onChange={(e) => {
+            handleFormulaChange(e.target.value);
+          }}
+          placeholder="Enter a value or formula"
+          style={{
+            flex: 1,
+            height: 26,
+            border: 'none',
+            outline: 'none',
+            fontSize: 13,
+            fontFamily: '-apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif',
+            background: 'transparent',
+          }}
+        />
+      </div>
+
       {/* ---- Sheet Canvas ---- */}
       <div style={{ flex: 1, overflow: 'hidden', position: 'relative' }}>
-        <SheetView onReady={handleReady} onSelectionChange={handleSelectionChange} />
+        <SheetView
+          data={sheetData}
+          onReady={handleReady}
+          onSelectionChange={handleSelectionChange}
+          onCellChange={handleCellChange}
+        />
       </div>
     </div>
   );
@@ -193,16 +285,7 @@ function ToolbarButtonGroup({
 }
 
 function ToolbarDivider() {
-  return (
-    <div
-      style={{
-        width: 1,
-        height: 20,
-        background: '#d4d4d4',
-        margin: '0 4px',
-      }}
-    />
-  );
+  return <div style={{ width: 1, height: 20, background: '#d4d4d4', margin: '0 4px' }} />;
 }
 
 interface ZoomButtonProps {

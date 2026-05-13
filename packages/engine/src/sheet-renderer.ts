@@ -1,5 +1,11 @@
 import type { CellPosition, SheetData } from '@universal-sheet/core';
-import { createPosition, getCellData, getColumnWidth, getRowHeight } from '@universal-sheet/core';
+import {
+  createPosition,
+  getCellData,
+  getColumnWidth,
+  getRowHeight,
+  setCellValue,
+} from '@universal-sheet/core';
 
 import {
   clampViewport,
@@ -18,6 +24,14 @@ import {
   zoomViewport,
 } from './index';
 
+/** A rectangle in canvas pixel coordinates (relative to the canvas element). */
+export interface CellRect {
+  readonly x: number;
+  readonly y: number;
+  readonly width: number;
+  readonly height: number;
+}
+
 /** Configuration for the SheetRenderer. */
 export interface RendererConfig {
   /** The canvas element to render into. */
@@ -28,6 +42,16 @@ export interface RendererConfig {
   readonly theme?: Partial<SheetTheme>;
   /** Called when a cell is clicked or navigated to. */
   readonly onSelectionChange?: (pos: CellPosition | null) => void;
+  /** Called when the user requests to edit the current cell.
+   *  `initial` is set when the user starts typing to replace content;
+   *  undefined means keep existing content (Enter / double-click). */
+  readonly onEditStart?: (initial?: string) => void;
+  /** Called on Ctrl+C with the selected cell's text value. */
+  readonly onCopy?: (value: string) => void;
+  /** Called on Ctrl+V; the caller should return the text to paste. */
+  readonly onPaste?: () => string | null;
+  /** Called whenever the viewport changes (scroll / zoom / resize). */
+  readonly onViewportChange?: () => void;
 }
 
 /**
@@ -44,10 +68,15 @@ export class SheetRenderer {
   private viewport: ViewportState;
   private selectedCell: CellPosition | null = null;
   private onSelectionChange?: (pos: CellPosition | null) => void;
+  private onEditStart?: (initial?: string) => void;
+  private onCopy?: (value: string) => void;
+  private onPaste?: () => string | null;
+  private onViewportChange?: () => void;
 
   private devicePixelRatio: number;
   private boundHandleWheel: (e: WheelEvent) => void;
-  private boundHandleClick: (e: MouseEvent) => void;
+  private boundHandleDblClick: (e: MouseEvent) => void;
+  private boundHandleKeyDown: (e: KeyboardEvent) => void;
   private boundHandleMouseDown: (e: MouseEvent) => void;
   private boundHandleMouseMove: (e: MouseEvent) => void;
   private boundHandleMouseUp: (e: MouseEvent) => void;
@@ -68,6 +97,10 @@ export class SheetRenderer {
     this.sheet = config.sheet;
     this.theme = { ...DEFAULT_THEME, ...config.theme };
     this.onSelectionChange = config.onSelectionChange;
+    this.onEditStart = config.onEditStart;
+    this.onCopy = config.onCopy;
+    this.onPaste = config.onPaste;
+    this.onViewportChange = config.onViewportChange;
     this.devicePixelRatio = window.devicePixelRatio || 1;
 
     const ctx = config.canvas.getContext('2d');
@@ -91,7 +124,8 @@ export class SheetRenderer {
     this.viewport = clampViewport(this.viewport, this.contentSize);
 
     this.boundHandleWheel = this.handleWheel.bind(this);
-    this.boundHandleClick = this.handleClick.bind(this);
+    this.boundHandleDblClick = this.handleDblClick.bind(this);
+    this.boundHandleKeyDown = this.handleKeyDown.bind(this);
     this.boundHandleMouseDown = this.handleMouseDown.bind(this);
     this.boundHandleMouseMove = this.handleMouseMove.bind(this);
     this.boundHandleMouseUp = this.handleMouseUp.bind(this);
@@ -141,7 +175,7 @@ export class SheetRenderer {
       this.contentSize,
     );
     this.viewport = vp;
-    this.queueRender();
+    this.notifyViewportChange();
   }
 
   /**
@@ -156,10 +190,38 @@ export class SheetRenderer {
     return { ...this.viewport };
   }
 
+  /** Returns the currently selected cell position, or null. */
+  getSelectedCell(): CellPosition | null {
+    return this.selectedCell ? { ...this.selectedCell } : null;
+  }
+
+  /**
+   * Returns the canvas-pixel rectangle of the given cell.
+   * Coordinates are relative to the canvas element.
+   */
+  getCellRect(row: number, col: number): CellRect {
+    const { zoom, scrollX, scrollY } = this.viewport;
+    const { headerColWidth, headerRowHeight } = this.sheet.config;
+    const colW = getColumnWidth(this.sheet, col);
+    const rowH = getRowHeight(this.sheet, row);
+
+    const worldX = headerColWidth + col * this.sheet.config.defaultColWidth;
+    const worldY = headerRowHeight + row * this.sheet.config.defaultRowHeight;
+
+    return {
+      x: worldX * zoom + scrollX,
+      y: worldY * zoom + scrollY,
+      width: colW * zoom,
+      height: rowH * zoom,
+    };
+  }
+
   /** Tears down event listeners. Call before unmounting. */
   destroy(): void {
     this.canvas.removeEventListener('wheel', this.boundHandleWheel);
+    this.canvas.removeEventListener('dblclick', this.boundHandleDblClick);
     this.canvas.removeEventListener('mousedown', this.boundHandleMouseDown);
+    this.canvas.removeEventListener('keydown', this.boundHandleKeyDown);
     window.removeEventListener('mousemove', this.boundHandleMouseMove);
     window.removeEventListener('mouseup', this.boundHandleMouseUp);
     window.removeEventListener('resize', this.boundHandleResize);
@@ -192,7 +254,7 @@ export class SheetRenderer {
         this.contentSize,
       );
       this.viewport = vp;
-      this.queueRender();
+      this.notifyViewportChange();
       return;
     }
 
@@ -204,7 +266,7 @@ export class SheetRenderer {
 
     const vp = clampViewport(panViewport(this.viewport, -deltaX, -deltaY), this.contentSize);
     this.viewport = vp;
-    this.queueRender();
+    this.notifyViewportChange();
   }
 
   /**
@@ -229,6 +291,116 @@ export class SheetRenderer {
       canvasHeight: this.canvas.clientHeight,
     };
     this.viewport = clampViewport(vp, this.contentSize);
+    this.notifyViewportChange();
+  }
+
+  /** Double-click on a cell starts editing. */
+  private handleDblClick(e: MouseEvent): void {
+    const rect = this.canvas.getBoundingClientRect();
+    const x = e.clientX - rect.left;
+    const y = e.clientY - rect.top;
+    const pos = this.pixelToCell(x, y);
+    if (pos) {
+      this.selectedCell = pos;
+      this.onSelectionChange?.(pos);
+      this.onEditStart?.();
+      this.queueRender();
+    }
+  }
+
+  /**
+   * Keyboard shortcuts:
+   * - Enter → start editing selected cell
+   * - Escape → clear selection
+   * - Ctrl+C → copy
+   * - Ctrl+V → paste
+   * - Tab → move selection right
+   */
+  private handleKeyDown(e: KeyboardEvent): void {
+    /* Ignore shortcuts when focus is on an input (e.g. editing overlay). */
+    if (e.target !== this.canvas) return;
+
+    if (e.key === 'Enter') {
+      e.preventDefault();
+      if (this.selectedCell) {
+        this.onEditStart?.();
+      }
+      return;
+    }
+
+    if (e.key === 'Escape') {
+      this.selectedCell = null;
+      this.onSelectionChange?.(null);
+      this.queueRender();
+      return;
+    }
+
+    if (e.key === 'Tab') {
+      e.preventDefault();
+      this.moveSelection(e.shiftKey ? -1 : 1, 0);
+      return;
+    }
+
+    if ((e.ctrlKey || e.metaKey) && e.key === 'c') {
+      e.preventDefault();
+      if (this.selectedCell) {
+        const cell = getCellData(this.sheet, this.selectedCell.row, this.selectedCell.col);
+        const text = cell?.value != null ? String(cell.value) : '';
+        this.onCopy?.(text);
+      }
+      return;
+    }
+
+    if ((e.ctrlKey || e.metaKey) && e.key === 'v') {
+      e.preventDefault();
+      const pasted = this.onPaste?.();
+      if (pasted !== null && pasted !== undefined && this.selectedCell) {
+        const updated = setCellValue(
+          this.sheet,
+          this.selectedCell.row,
+          this.selectedCell.col,
+          pasted,
+        );
+        this.updateSheet(updated);
+      }
+      return;
+    }
+
+    /* Printable character keys — start editing with the key as initial value,
+     * replacing existing cell content (Excel-like single-click typing). */
+    if (e.key.length === 1 && !e.ctrlKey && !e.metaKey && !e.altKey) {
+      e.preventDefault();
+      if (this.selectedCell) {
+        this.onEditStart?.(e.key);
+      }
+      return;
+    }
+
+    /* Arrow keys move selection. */
+    const arrowMap: Record<string, [number, number]> = {
+      ArrowUp: [-1, 0],
+      ArrowDown: [1, 0],
+      ArrowLeft: [0, -1],
+      ArrowRight: [0, 1],
+    };
+    const delta = arrowMap[e.key];
+    if (delta) {
+      e.preventDefault();
+      this.moveSelection(delta[0], delta[1]);
+    }
+  }
+
+  /** Moves the selected cell by the given delta, clamping to sheet bounds. */
+  private moveSelection(dRow: number, dCol: number): void {
+    if (!this.selectedCell) {
+      this.selectedCell = createPosition(0, 0);
+    } else {
+      const { row, col } = this.selectedCell;
+      const newRow = Math.max(0, Math.min(this.sheet.config.rowCount - 1, row + dRow));
+      const newCol = Math.max(0, Math.min(this.sheet.config.colCount - 1, col + dCol));
+      this.selectedCell = createPosition(newRow, newCol);
+    }
+    this.onSelectionChange?.(this.selectedCell);
     this.queueRender();
   }
 
@@ -263,7 +435,7 @@ export class SheetRenderer {
           const contentW = this.contentSize.width * this.viewport.zoom;
           const newScroll = -((x / sb.h.trackLength) * contentW);
           this.viewport = clampViewport({ ...this.viewport, scrollX: newScroll }, this.contentSize);
-          this.queueRender();
+          this.notifyViewportChange();
           e.preventDefault();
           return;
         }
@@ -287,7 +459,7 @@ export class SheetRenderer {
           const contentH = this.contentSize.height * this.viewport.zoom;
           const newScroll = -((y / sb.v.trackLength) * contentH);
           this.viewport = clampViewport({ ...this.viewport, scrollY: newScroll }, this.contentSize);
-          this.queueRender();
+          this.notifyViewportChange();
           e.preventDefault();
           return;
         }
@@ -323,7 +495,7 @@ export class SheetRenderer {
       vp = panViewport(this.viewport, 0, -scrollDelta);
     }
     this.viewport = clampViewport(vp, this.contentSize);
-    this.queueRender();
+    this.notifyViewportChange();
   }
 
   private handleMouseUp(_e: MouseEvent): void {
@@ -385,6 +557,12 @@ export class SheetRenderer {
     });
   }
 
+  /** Notifies the parent that the viewport changed and queues a render. */
+  private notifyViewportChange(): void {
+    this.onViewportChange?.();
+    this.queueRender();
+  }
+
   /* ------------------------------------------------------------------ */
   /*  Main Render                                                        */
   /* ------------------------------------------------------------------ */
@@ -401,8 +579,8 @@ export class SheetRenderer {
     ctx.scale(zoom, zoom);
     this.renderDataBg();
     this.renderGridLines();
-    this.renderCells();
     this.renderSelection();
+    this.renderCells();
     ctx.restore();
 
     /* 2. Row headers — sticky left, scrolls vertically. On top of grid. */
@@ -642,7 +820,6 @@ export class SheetRenderer {
 
     ctx.font = `${theme.cellFontSize}px ${theme.fontFamily}`;
     ctx.textBaseline = 'middle';
-    ctx.save();
 
     for (let r = visible.firstRow; r <= visible.lastRow; r++) {
       for (let c = visible.firstCol; c <= visible.lastCol; c++) {
@@ -671,17 +848,17 @@ export class SheetRenderer {
           textX = x + padding;
         }
 
-        // Clip to cell bounds
+        /* save/restore per cell so clip() doesn't accumulate across cells. */
+        ctx.save();
         ctx.beginPath();
         ctx.rect(x, y, colW, rowH);
         ctx.clip();
 
         const display = cell.displayValue ?? String(cell.value);
         ctx.fillText(display, textX, y + rowH / 2);
+        ctx.restore();
       }
     }
-
-    ctx.restore();
   }
 
   /* ------------------------------------------------------------------ */
@@ -769,7 +946,9 @@ export class SheetRenderer {
 
   private attachEvents(): void {
     this.canvas.addEventListener('wheel', this.boundHandleWheel, { passive: false });
+    this.canvas.addEventListener('dblclick', this.boundHandleDblClick);
     this.canvas.addEventListener('mousedown', this.boundHandleMouseDown);
+    this.canvas.addEventListener('keydown', this.boundHandleKeyDown);
     window.addEventListener('mousemove', this.boundHandleMouseMove);
     window.addEventListener('mouseup', this.boundHandleMouseUp);
     window.addEventListener('resize', this.boundHandleResize);
