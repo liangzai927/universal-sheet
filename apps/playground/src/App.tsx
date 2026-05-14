@@ -1,5 +1,5 @@
-import type { CellPosition, SheetData } from '@universal-sheet/core';
-import { createSheetData, getCellData, setCellValue } from '@universal-sheet/core';
+import type { CellPosition, CellRange, SheetData } from '@universal-sheet/core';
+import { createSheetData, getCellData, setCellValue, UndoRedoManager } from '@universal-sheet/core';
 import type { SheetRenderer } from '@universal-sheet/engine';
 import { useCallback, useRef, useState } from 'react';
 
@@ -21,6 +21,11 @@ function cellLabel(pos: CellPosition): string {
   return columnLabel(pos.col) + String(pos.row + 1);
 }
 
+/** Creates a single-cell CellRange from a CellPosition. */
+function cellRange(pos: CellPosition): CellRange {
+  return { startRow: pos.row, startCol: pos.col, endRow: pos.row, endCol: pos.col };
+}
+
 export default function App() {
   const rendererRef = useRef<SheetRenderer | null>(null);
   const [zoom, setZoom] = useState(100);
@@ -35,6 +40,17 @@ export default function App() {
   const sheetDataRef = useRef(sheetData);
   sheetDataRef.current = sheetData;
   const formulaProgramRef = useRef(false);
+
+  const undoManagerRef = useRef(new UndoRedoManager());
+  const [canUndo, setCanUndo] = useState(false);
+  const [canRedo, setCanRedo] = useState(false);
+
+  /** Push current state + affected cell to undo stack before a mutation commits. */
+  const pushUndo = (range: CellRange | null) => {
+    undoManagerRef.current.push(sheetDataRef.current, range);
+    setCanUndo(undoManagerRef.current.canUndo);
+    setCanRedo(undoManagerRef.current.canRedo);
+  };
 
   /* ---- Renderer callbacks ---- */
 
@@ -59,6 +75,7 @@ export default function App() {
   }, []);
 
   const handleCellChange = useCallback((_updated: SheetData, pos: CellPosition, _value: string) => {
+    pushUndo(cellRange(pos));
     sheetDataRef.current = _updated;
     setSheetData(_updated);
     if (selectedPosRef.current?.row === pos.row && selectedPosRef.current.col === pos.col) {
@@ -69,6 +86,8 @@ export default function App() {
   }, []);
 
   const handleSheetChange = useCallback((sheet: SheetData) => {
+    const pos = selectedPosRef.current;
+    pushUndo(pos ? cellRange(pos) : null);
     sheetDataRef.current = sheet;
     setSheetData(sheet);
   }, []);
@@ -95,6 +114,69 @@ export default function App() {
     r.zoomTo(1);
     setZoom(100);
   };
+
+  /* ---- Undo / Redo ---- */
+
+  const handleUndo = useCallback(() => {
+    const curPos = selectedPosRef.current;
+    const curRange: CellRange | null = curPos ? cellRange(curPos) : null;
+    const entry = undoManagerRef.current.undo(sheetDataRef.current, curRange);
+    if (entry) {
+      sheetDataRef.current = entry.sheet;
+      setSheetData(entry.sheet);
+      rendererRef.current?.updateSheet(entry.sheet);
+      /* Restore the affected range selection. */
+      if (entry.range) {
+        const rng = entry.range;
+        if (rng.startRow === rng.endRow && rng.startCol === rng.endCol) {
+          const pos = { row: rng.startRow, col: rng.startCol };
+          setSelectedPos(pos);
+          setSelectedCell(cellLabel(pos));
+          rendererRef.current?.selectCell(pos);
+        } else {
+          setSelectedPos({ row: rng.endRow, col: rng.endCol });
+          setSelectedCell(
+            cellLabel({ row: rng.startRow, col: rng.startCol }) +
+              ':' +
+              cellLabel({ row: rng.endRow, col: rng.endCol }),
+          );
+          rendererRef.current?.selectRange(rng);
+        }
+      }
+    }
+    setCanUndo(undoManagerRef.current.canUndo);
+    setCanRedo(undoManagerRef.current.canRedo);
+  }, []);
+
+  const handleRedo = useCallback(() => {
+    const curPos = selectedPosRef.current;
+    const curRange: CellRange | null = curPos ? cellRange(curPos) : null;
+    const entry = undoManagerRef.current.redo(sheetDataRef.current, curRange);
+    if (entry) {
+      sheetDataRef.current = entry.sheet;
+      setSheetData(entry.sheet);
+      rendererRef.current?.updateSheet(entry.sheet);
+      if (entry.range) {
+        const rng = entry.range;
+        if (rng.startRow === rng.endRow && rng.startCol === rng.endCol) {
+          const pos = { row: rng.startRow, col: rng.startCol };
+          setSelectedPos(pos);
+          setSelectedCell(cellLabel(pos));
+          rendererRef.current?.selectCell(pos);
+        } else {
+          setSelectedPos({ row: rng.endRow, col: rng.endCol });
+          setSelectedCell(
+            cellLabel({ row: rng.startRow, col: rng.startCol }) +
+              ':' +
+              cellLabel({ row: rng.endRow, col: rng.endCol }),
+          );
+          rendererRef.current?.selectRange(rng);
+        }
+      }
+    }
+    setCanUndo(undoManagerRef.current.canUndo);
+    setCanRedo(undoManagerRef.current.canRedo);
+  }, []);
 
   /* ---- Formula bar edit ---- */
 
@@ -137,8 +219,12 @@ export default function App() {
         <ToolbarDivider />
 
         <ToolbarButtonGroup label="Edit">
-          <ToolbarButton disabled>Undo</ToolbarButton>
-          <ToolbarButton disabled>Redo</ToolbarButton>
+          <ToolbarButton disabled={!canUndo} onClick={handleUndo}>
+            ↩
+          </ToolbarButton>
+          <ToolbarButton disabled={!canRedo} onClick={handleRedo}>
+            ↪
+          </ToolbarButton>
         </ToolbarButtonGroup>
 
         <ToolbarDivider />
@@ -241,6 +327,8 @@ export default function App() {
           onSelectionChange={handleSelectionChange}
           onCellChange={handleCellChange}
           onSheetChange={handleSheetChange}
+          onUndo={handleUndo}
+          onRedo={handleRedo}
         />
       </div>
     </div>
@@ -253,13 +341,15 @@ export default function App() {
 
 interface ToolbarButtonProps {
   readonly disabled?: boolean;
+  readonly onClick?: () => void;
   readonly children: React.ReactNode;
 }
 
-function ToolbarButton({ disabled, children }: ToolbarButtonProps) {
+function ToolbarButton({ disabled, onClick, children }: ToolbarButtonProps) {
   return (
     <button
       disabled={disabled}
+      onClick={onClick}
       style={{
         padding: '4px 10px',
         fontSize: 13,

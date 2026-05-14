@@ -269,6 +269,30 @@ export class SheetRenderer {
   }
 
   /**
+   * Programmatically sets the selected cell (for undo/redo, etc.).
+   * Collapses any range selection to a single cell.
+   */
+  selectCell(pos: CellPosition): void {
+    this.selectedCell = pos;
+    this.selectionAnchor = pos;
+    this.selectionType = 'cell';
+    this.onSelectionChange?.(pos);
+    this.queueRender();
+  }
+
+  /**
+   * Programmatically selects a cell range (for undo/redo after multi-cell
+   * operations like paste).
+   */
+  selectRange(range: CellRange): void {
+    this.selectedCell = createPosition(range.endRow, range.endCol);
+    this.selectionAnchor = createPosition(range.startRow, range.startCol);
+    this.selectionType = 'cell';
+    this.onSelectionChange?.(this.selectedCell);
+    this.queueRender();
+  }
+
+  /**
    * Copies the current selection range to the clipboard.
    * Sets the copied range for marching ants animation.
    */

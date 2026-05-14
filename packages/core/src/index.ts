@@ -24,3 +24,5 @@ export type {
   SheetData,
 } from './types';
 export { cellKey, createPosition } from './types';
+export type { HistoryEntry } from './undo-redo';
+export { UndoRedoManager } from './undo-redo';

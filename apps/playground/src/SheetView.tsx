@@ -21,6 +21,10 @@ interface SheetViewProps {
   readonly onReady?: (renderer: SheetRenderer) => void;
   readonly onCellChange?: (sheet: SheetData, pos: CellPosition, value: string) => void;
   readonly onSheetChange?: (sheet: SheetData) => void;
+  /** Called on Ctrl+Z. */
+  readonly onUndo?: () => void;
+  /** Called on Ctrl+Y (or Ctrl+Shift+Z). */
+  readonly onRedo?: () => void;
 }
 
 /**
@@ -37,6 +41,8 @@ export const SheetView = memo(function SheetView({
   onReady,
   onCellChange,
   onSheetChange,
+  onUndo,
+  onRedo,
 }: SheetViewProps) {
   const canvasRef = useRef<HTMLCanvasElement>(null);
   const inputRef = useRef<HTMLTextAreaElement>(null);
@@ -91,6 +97,16 @@ export const SheetView = memo(function SheetView({
     if (!state || !rendererRef.current) return;
     const { pos } = state;
     const value = inputRef.current?.value ?? '';
+
+    /* Skip if nothing actually changed (e.g. Enter on an empty cell). */
+    const oldCell = getCellData(sheetDataRef.current, pos.row, pos.col);
+    const oldValue = oldCell?.value != null ? String(oldCell.value) : '';
+    if (value === oldValue) {
+      setEditState(null);
+      proxyRef.current?.focus();
+      return;
+    }
+
     let updated = setCellValue(sheetDataRef.current, pos.row, pos.col, value);
 
     const lines = value.split('\n').length;
@@ -272,6 +288,20 @@ export const SheetView = memo(function SheetView({
       }
 
       if (e.ctrlKey || e.metaKey) {
+        if (e.key === 'z' || e.key === 'Z') {
+          e.preventDefault();
+          if (e.shiftKey) {
+            onRedo?.();
+          } else {
+            onUndo?.();
+          }
+          return;
+        }
+        if (e.key === 'y' || e.key === 'Y') {
+          e.preventDefault();
+          onRedo?.();
+          return;
+        }
         if (e.key === 'c') {
           e.preventDefault();
           r?.copySelection();
@@ -324,6 +354,8 @@ export const SheetView = memo(function SheetView({
         e.preventDefault();
         const pos = r?.getSelectedCell();
         if (pos) {
+          const cell = getCellData(sheetDataRef.current, pos.row, pos.col);
+          if (cell?.value == null) return; /* Already empty — no-op. */
           const updated = setCellValue(sheetDataRef.current, pos.row, pos.col, null);
           r?.updateSheet(updated);
           onCellChange?.(updated, pos, '');
