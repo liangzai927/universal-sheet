@@ -61,10 +61,10 @@ export interface RendererConfig {
   readonly theme?: Partial<SheetTheme>;
   /** Called when a cell is clicked or navigated to. */
   readonly onSelectionChange?: (pos: CellPosition | null) => void;
-  /** Called when the user requests to edit the current cell.
-   *  `initial` is set when the user starts typing to replace content;
-   *  undefined means keep existing content (Enter / double-click). */
-  readonly onEditStart?: (initial?: string) => void;
+  /** Called when the user requests to edit the current cell
+   *  (Enter / double-click). Text input is captured by a proxy element
+   *  in the UI layer so IME composition works correctly. */
+  readonly onEditStart?: () => void;
   /** Called on Ctrl+C with the selected range's text value. */
   readonly onCopy?: (value: string) => void;
   /** Called on Ctrl+V; the caller should return the text to paste. */
@@ -292,6 +292,14 @@ export class SheetRenderer {
     const updated = pasteCellRangeText(this.sheet, pos.row, pos.col, text);
     this.updateSheet(updated);
     this.copiedRange = null;
+    /* Notify the parent so React state stays in sync with the engine. */
+    this.onSheetMutated?.();
+  }
+
+  /** Clears the marching ants copied-range indicator. */
+  clearCopiedRange(): void {
+    this.copiedRange = null;
+    this.queueRender();
   }
 
   /**
@@ -496,16 +504,7 @@ export class SheetRenderer {
         );
         this.updateSheet(updated);
         this.copiedRange = null;
-      }
-      return;
-    }
-
-    /* Printable character keys — start editing with the key as initial value,
-     * replacing existing cell content (Excel-like single-click typing). */
-    if (e.key.length === 1 && !e.ctrlKey && !e.metaKey && !e.altKey) {
-      e.preventDefault();
-      if (this.selectedCell) {
-        this.onEditStart?.(e.key);
+        this.onSheetMutated?.();
       }
       return;
     }
@@ -547,6 +546,8 @@ export class SheetRenderer {
       const newCol = Math.max(0, Math.min(this.sheet.config.colCount - 1, col + dCol));
       this.selectedCell = createPosition(newRow, newCol);
     }
+    /* Reset anchor so the selection collapses to a single cell (Excel-like). */
+    this.selectionAnchor = this.selectedCell;
     this.onSelectionChange?.(this.selectedCell);
     this.queueRender();
   }

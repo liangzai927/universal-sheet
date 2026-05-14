@@ -16,21 +16,20 @@ function noop(): void {
 }
 
 interface SheetViewProps {
-  /** Optional sheet data to display. */
   readonly data?: SheetData;
-  /** Called when the selected cell changes. */
   readonly onSelectionChange?: (pos: CellPosition | null) => void;
-  /** Called when the renderer is ready with a reference for external control. */
   readonly onReady?: (renderer: SheetRenderer) => void;
-  /** Called when a cell's value changes via editing or paste. */
   readonly onCellChange?: (sheet: SheetData, pos: CellPosition, value: string) => void;
-  /** Called when the sheet data is modified internally (e.g. column resize). */
   readonly onSheetChange?: (sheet: SheetData) => void;
 }
 
 /**
  * React wrapper around the Canvas-based SheetRenderer.
- * Manages an overlay input for cell editing.
+ *
+ * A hidden off-screen input element captures keyboard input (including IME
+ * composition) when the canvas "has focus".  This mirrors how Google Sheets
+ * and Excel Online handle IME on a canvas surface — the browser needs a
+ * real text-editable element for the IME to compose into.
  */
 export const SheetView = memo(function SheetView({
   data,
@@ -41,7 +40,15 @@ export const SheetView = memo(function SheetView({
 }: SheetViewProps) {
   const canvasRef = useRef<HTMLCanvasElement>(null);
   const inputRef = useRef<HTMLTextAreaElement>(null);
+  const proxyRef = useRef<HTMLInputElement>(null);
   const rendererRef = useRef<SheetRenderer | null>(null);
+
+  const isComposingRef = useRef(false);
+
+  /** Viewport-relative position of the hidden proxy input so IME candidate
+   * windows appear near the selected cell instead of at the screen origin. */
+  const [proxyPos, setProxyPos] = useState<{ x: number; y: number }>({ x: 0, y: 0 });
+  const selectedPosRef = useRef<CellPosition | null>(null);
 
   const [editState, setEditState] = useState<{
     pos: CellPosition;
@@ -59,13 +66,56 @@ export const SheetView = memo(function SheetView({
   } | null>(null);
 
   const sheetData = data ?? createSheetData();
-
-  /* Keep a ref to the latest sheetData so callbacks never see a stale version. */
   const sheetDataRef = useRef(sheetData);
   sheetDataRef.current = sheetData;
 
-  /* Internal copy buffer (fallback when clipboard API is unavailable). */
   const copyBuffer = useRef('');
+
+  /* ---- Start / commit / cancel editing ---- */
+
+  const startEdit = useCallback((pos: CellPosition, initial?: string) => {
+    const renderer = rendererRef.current;
+    if (!renderer) return;
+    const rect = renderer.getCellRect(pos.row, pos.col);
+    const value =
+      initial ??
+      (() => {
+        const cell = getCellData(sheetDataRef.current, pos.row, pos.col);
+        return cell?.value != null ? String(cell.value) : '';
+      })();
+    setEditState({ pos, x: rect.x, y: rect.y, width: rect.width, height: rect.height, value });
+  }, []);
+
+  const commitEdit = useCallback(() => {
+    const state = editState;
+    if (!state || !rendererRef.current) return;
+    const { pos } = state;
+    const value = inputRef.current?.value ?? '';
+    let updated = setCellValue(sheetDataRef.current, pos.row, pos.col, value);
+
+    const lines = value.split('\n').length;
+    const CELL_FONT_SIZE = 13;
+    const CELL_PADDING = 6;
+    const neededHeight = Math.max(
+      sheetDataRef.current.config.defaultRowHeight,
+      CELL_PADDING * 2 + lines * CELL_FONT_SIZE * 1.4,
+    );
+    const currentHeight = getRowHeight(updated, pos.row);
+    if (neededHeight > currentHeight) {
+      updated = setRowHeight(updated, pos.row, neededHeight);
+    }
+
+    rendererRef.current.updateSheet(updated);
+    onCellChange?.(updated, pos, value);
+    setEditState(null);
+    /* Return focus to the proxy so the next keystroke is captured. */
+    proxyRef.current?.focus();
+  }, [editState, onCellChange]);
+
+  const cancelEdit = useCallback(() => {
+    setEditState(null);
+    proxyRef.current?.focus();
+  }, []);
 
   /* ---- Renderer lifecycle ---- */
 
@@ -78,20 +128,18 @@ export const SheetView = memo(function SheetView({
       sheet: sheetData,
       onSelectionChange: (pos) => {
         onSelectionChange?.(pos);
+        /* Move the hidden proxy input near the selected cell so IME
+         * candidate windows appear next to the cell being edited. */
+        if (pos) {
+          selectedPosRef.current = pos;
+          const rect = renderer.getCellRect(pos.row, pos.col);
+          setProxyPos({ x: rect.x, y: rect.y });
+        }
       },
-      onEditStart: (initial?: string) => {
+      onEditStart: () => {
+        /* Enter / double-click — edit with existing cell value. */
         const pos = renderer.getSelectedCell();
-        if (!pos) return;
-        const rect = renderer.getCellRect(pos.row, pos.col);
-        /* If `initial` is provided (single-key typing), use it to replace content.
-         * Otherwise (Enter / double-click), read existing cell value. */
-        const value =
-          initial ??
-          (() => {
-            const cell = getCellData(sheetDataRef.current, pos.row, pos.col);
-            return cell?.value != null ? String(cell.value) : '';
-          })();
-        setEditState({ pos, x: rect.x, y: rect.y, width: rect.width, height: rect.height, value });
+        if (pos) startEdit(pos);
       },
       onCopy: (value) => {
         copyBuffer.current = value;
@@ -104,17 +152,23 @@ export const SheetView = memo(function SheetView({
       onViewportChange: () => {
         setEditState(null);
         setContextMenu(null);
+        /* Reposition proxy after scroll/zoom. */
+        const pos = selectedPosRef.current;
+        if (pos) {
+          const rect = renderer.getCellRect(pos.row, pos.col);
+          setProxyPos({ x: rect.x, y: rect.y });
+        }
+        if (!isComposingRef.current) proxyRef.current?.focus();
       },
-      onColumnResize: (col: number, width: number) => {
+      onColumnResize: (col, width) => {
         const updated = setColW(sheetDataRef.current, col, width);
         onSheetChange?.(updated);
       },
-      onRowResize: (row: number, height: number) => {
+      onRowResize: (row, height) => {
         const updated = setRowHeight(sheetDataRef.current, row, height);
         onSheetChange?.(updated);
       },
       onSheetMutated: () => {
-        /* After batch resize, re-sync the full sheet from the renderer. */
         onSheetChange?.(renderer.getSheet());
       },
     });
@@ -135,43 +189,173 @@ export const SheetView = memo(function SheetView({
     }
   }, [data]);
 
-  /* Auto-focus the overlay input when editing begins. */
+  /* Focus visible textarea when editing starts (not during IME composition). */
   useEffect(() => {
-    if (editState && inputRef.current) {
-      inputRef.current.focus();
+    if (editState && inputRef.current && !isComposingRef.current) {
+      const input = inputRef.current;
+      input.focus();
+      const len = input.value.length;
+      input.setSelectionRange(len, len);
     }
   }, [editState]);
 
-  /* ---- Edit commit / cancel ---- */
+  /* ---- Proxy input: captures keyboard input (including IME) for the canvas ---- */
 
-  const commitEdit = useCallback(() => {
-    if (!editState || !rendererRef.current) return;
-    const { pos, value } = editState;
-    let updated = setCellValue(sheetDataRef.current, pos.row, pos.col, value);
+  /** Redirect focus from canvas to the hidden proxy input. */
+  const handleCanvasFocus = useCallback(() => {
+    if (!editState) proxyRef.current?.focus();
+  }, [editState]);
 
-    /* Auto-expand row height for multi-line content. */
-    const lines = value.split('\n').length;
-    const CELL_FONT_SIZE = 13;
-    const CELL_PADDING = 6;
-    const neededHeight = Math.max(
-      sheetDataRef.current.config.defaultRowHeight,
-      CELL_PADDING * 2 + lines * CELL_FONT_SIZE * 1.4,
-    );
-    const currentHeight = getRowHeight(updated, pos.row);
-    if (neededHeight > currentHeight) {
-      updated = setRowHeight(updated, pos.row, neededHeight);
+  /**
+   * Processes text typed into the proxy input.
+   * For non-IME input: starts editing with the typed character.
+   * For IME input: during composition the editor mirrors text; on
+   * compositionend the final value is committed to the editor.
+   */
+  const handleProxyInput = useCallback(
+    (e: React.FormEvent<HTMLInputElement>) => {
+      if (isComposingRef.current) return; /* compositionend handles this */
+
+      const proxy = e.currentTarget;
+      const text = proxy.value;
+      if (!text) return;
+
+      if (!editState) {
+        const pos = rendererRef.current?.getSelectedCell();
+        if (!pos) {
+          proxy.value = '';
+          return;
+        }
+        startEdit(pos, text);
+      } else {
+        /* Editor is already open (from compositionstart); transfer the text. */
+        if (inputRef.current) {
+          inputRef.current.value = text;
+          inputRef.current.focus();
+          const len = text.length;
+          inputRef.current.setSelectionRange(len, len);
+        }
+      }
+      proxy.value = '';
+    },
+    [editState, startEdit],
+  );
+
+  const handleProxyCompositionStart = useCallback(() => {
+    isComposingRef.current = true;
+    /* Open the editor immediately so the user sees the IME composition UI. */
+    if (!editState) {
+      const pos = rendererRef.current?.getSelectedCell();
+      if (pos) startEdit(pos, '');
     }
+  }, [editState, startEdit]);
 
-    rendererRef.current.updateSheet(updated);
-    onCellChange?.(updated, pos, value);
-    setEditState(null);
-    canvasRef.current?.focus();
-  }, [editState, onCellChange]);
-
-  const cancelEdit = useCallback(() => {
-    setEditState(null);
-    canvasRef.current?.focus();
+  const handleProxyCompositionEnd = useCallback((e: React.CompositionEvent<HTMLInputElement>) => {
+    isComposingRef.current = false;
+    const text = e.data;
+    if (inputRef.current) {
+      inputRef.current.value = text;
+      inputRef.current.focus();
+      const len = text.length;
+      inputRef.current.setSelectionRange(len, len);
+    }
   }, []);
+
+  /** Forward navigation / shortcut keys from the proxy to the engine. */
+  const handleProxyKeyDown = useCallback(
+    (e: React.KeyboardEvent<HTMLInputElement>) => {
+      const r = rendererRef.current;
+
+      /* Any key press clears marching ants (except Ctrl+C which re-sets it). */
+      if (!(e.ctrlKey || e.metaKey) || e.key !== 'c') {
+        r?.clearCopiedRange();
+      }
+
+      if (e.ctrlKey || e.metaKey) {
+        if (e.key === 'c') {
+          e.preventDefault();
+          r?.copySelection();
+          return;
+        }
+        if (e.key === 'v') {
+          e.preventDefault();
+          void (async () => {
+            try {
+              const text = await navigator.clipboard.readText();
+              if (text) r?.pasteText(text);
+            } catch {
+              if (copyBuffer.current) r?.pasteText(copyBuffer.current);
+            }
+          })();
+          return;
+        }
+        return;
+      }
+
+      if (e.key === 'Enter') {
+        e.preventDefault();
+        const pos = r?.getSelectedCell();
+        if (pos) startEdit(pos);
+        return;
+      }
+      if (e.key === 'Escape') {
+        e.preventDefault();
+        r?.updateSheet(sheetDataRef.current);
+        return;
+      }
+      if (e.key === 'Tab') {
+        e.preventDefault();
+        r?.moveSelectedCell(0, e.shiftKey ? -1 : 1);
+        return;
+      }
+      if (e.key.startsWith('Arrow')) {
+        e.preventDefault();
+        const delta: Record<string, [number, number]> = {
+          ArrowUp: [-1, 0],
+          ArrowDown: [1, 0],
+          ArrowLeft: [0, -1],
+          ArrowRight: [0, 1],
+        };
+        const d = delta[e.key];
+        if (d) r?.moveSelectedCell(d[0], d[1]);
+        return;
+      }
+      if (e.key === 'Delete' || e.key === 'Backspace') {
+        e.preventDefault();
+        const pos = r?.getSelectedCell();
+        if (pos) {
+          const updated = setCellValue(sheetDataRef.current, pos.row, pos.col, null);
+          r?.updateSheet(updated);
+          onCellChange?.(updated, pos, '');
+        }
+        return;
+      }
+    },
+    [startEdit, onCellChange],
+  );
+
+  /* ---- Visible editor key bindings ---- */
+
+  const handleInputKeyDown = useCallback(
+    (e: React.KeyboardEvent<HTMLTextAreaElement>) => {
+      if (e.key === 'Enter') {
+        if (e.shiftKey) return; /* Shift+Enter = newline */
+        e.preventDefault();
+        commitEdit();
+        rendererRef.current?.moveSelectedCell(1, 0);
+      } else if (e.key === 'Escape') {
+        e.preventDefault();
+        cancelEdit();
+      } else if (e.key === 'Tab') {
+        e.preventDefault();
+        commitEdit();
+        rendererRef.current?.moveSelectedCell(0, e.shiftKey ? -1 : 1);
+      }
+    },
+    [commitEdit, cancelEdit],
+  );
+
+  /* ---- Context menu ---- */
 
   const handleContextCopy = useCallback(() => {
     rendererRef.current?.copySelection();
@@ -188,44 +372,45 @@ export const SheetView = memo(function SheetView({
     setContextMenu(null);
   }, []);
 
-  const handleInputKeyDown = useCallback(
-    (e: React.KeyboardEvent<HTMLTextAreaElement>) => {
-      if (e.key === 'Enter') {
-        if (e.shiftKey) {
-          /* Shift+Enter: let textarea insert newline naturally. */
-          return;
-        }
-        /* Enter: commit and move selection down. */
-        e.preventDefault();
-        commitEdit();
-        rendererRef.current?.moveSelectedCell(1, 0);
-      } else if (e.key === 'Escape') {
-        e.preventDefault();
-        cancelEdit();
-      } else if (e.key === 'Tab') {
-        e.preventDefault();
-        commitEdit();
-        rendererRef.current?.moveSelectedCell(0, e.shiftKey ? -1 : 1);
-      }
-    },
-    [commitEdit, cancelEdit],
-  );
+  /* ---- Render ---- */
 
   return (
     <div className="us-sheet-container">
+      {/* Hidden proxy input — always in the DOM so IME composition works.
+          Positioned at the selected cell so the IME candidate window appears
+          next to the cell instead of at the screen origin. */}
+      <input
+        ref={proxyRef}
+        type="text"
+        defaultValue=""
+        onInput={handleProxyInput}
+        onCompositionStart={handleProxyCompositionStart}
+        onCompositionEnd={handleProxyCompositionEnd}
+        onKeyDown={handleProxyKeyDown}
+        style={{
+          position: 'absolute',
+          left: proxyPos.x,
+          top: proxyPos.y,
+          width: 1,
+          height: 1,
+          opacity: 0,
+          pointerEvents: 'none',
+          fontSize: 13,
+        }}
+      />
+
       <canvas
         ref={canvasRef}
         style={{ width: '100%', height: '100%', display: 'block' }}
         tabIndex={0}
+        onFocus={handleCanvasFocus}
       />
+
       {editState && (
         <textarea
           ref={inputRef}
           className="us-cell-editor"
-          value={editState.value}
-          onChange={(e) => {
-            setEditState((prev) => (prev ? { ...prev, value: e.target.value } : null));
-          }}
+          defaultValue={editState.value}
           onKeyDown={handleInputKeyDown}
           onBlur={commitEdit}
           rows={1}
@@ -249,6 +434,7 @@ export const SheetView = memo(function SheetView({
           }}
         />
       )}
+
       {contextMenu && (
         <ContextMenu
           x={contextMenu.x}
