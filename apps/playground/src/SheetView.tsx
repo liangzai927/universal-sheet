@@ -8,6 +8,7 @@ import {
   setRowHeight,
 } from '@universal-sheet/core';
 import { SheetRenderer } from '@universal-sheet/engine';
+import { ContextMenu } from '@universal-sheet/ui-react';
 import { memo, useCallback, useEffect, useRef, useState } from 'react';
 
 function noop(): void {
@@ -51,6 +52,12 @@ export const SheetView = memo(function SheetView({
     value: string;
   } | null>(null);
 
+  const [contextMenu, setContextMenu] = useState<{
+    pos: CellPosition;
+    x: number;
+    y: number;
+  } | null>(null);
+
   const sheetData = data ?? createSheetData();
 
   /* Keep a ref to the latest sheetData so callbacks never see a stale version. */
@@ -91,8 +98,12 @@ export const SheetView = memo(function SheetView({
         navigator.clipboard.writeText(value).catch(noop);
       },
       onPaste: () => copyBuffer.current,
+      onContextMenu: (pos, clientX, clientY) => {
+        setContextMenu({ pos, x: clientX, y: clientY });
+      },
       onViewportChange: () => {
         setEditState(null);
+        setContextMenu(null);
       },
       onColumnResize: (col: number, width: number) => {
         const updated = setColW(sheetDataRef.current, col, width);
@@ -162,6 +173,21 @@ export const SheetView = memo(function SheetView({
     canvasRef.current?.focus();
   }, []);
 
+  const handleContextCopy = useCallback(() => {
+    rendererRef.current?.copySelection();
+    setContextMenu(null);
+  }, []);
+
+  const handleContextPaste = useCallback(async () => {
+    try {
+      const text = await navigator.clipboard.readText();
+      if (text) rendererRef.current?.pasteText(text);
+    } catch {
+      if (copyBuffer.current) rendererRef.current?.pasteText(copyBuffer.current);
+    }
+    setContextMenu(null);
+  }, []);
+
   const handleInputKeyDown = useCallback(
     (e: React.KeyboardEvent<HTMLTextAreaElement>) => {
       if (e.key === 'Enter') {
@@ -220,6 +246,19 @@ export const SheetView = memo(function SheetView({
             resize: 'none',
             overflow: 'hidden',
             lineHeight: 1.4,
+          }}
+        />
+      )}
+      {contextMenu && (
+        <ContextMenu
+          x={contextMenu.x}
+          y={contextMenu.y}
+          onCopy={handleContextCopy}
+          onPaste={() => {
+            void handleContextPaste();
+          }}
+          onClose={() => {
+            setContextMenu(null);
           }}
         />
       )}

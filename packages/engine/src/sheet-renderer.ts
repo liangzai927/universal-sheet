@@ -1,10 +1,11 @@
-import type { CellPosition, SheetData } from '@universal-sheet/core';
+import type { CellPosition, CellRange, SheetData } from '@universal-sheet/core';
 import {
   createPosition,
+  extractCellRangeText,
   getCellData,
   getColumnWidth,
   getRowHeight,
-  setCellValue,
+  pasteCellRangeText,
   setColumnWidth,
   setRowHeight,
 } from '@universal-sheet/core';
@@ -64,10 +65,12 @@ export interface RendererConfig {
    *  `initial` is set when the user starts typing to replace content;
    *  undefined means keep existing content (Enter / double-click). */
   readonly onEditStart?: (initial?: string) => void;
-  /** Called on Ctrl+C with the selected cell's text value. */
+  /** Called on Ctrl+C with the selected range's text value. */
   readonly onCopy?: (value: string) => void;
   /** Called on Ctrl+V; the caller should return the text to paste. */
   readonly onPaste?: () => string | null;
+  /** Called on right-click with target cell position and mouse client coordinates. */
+  readonly onContextMenu?: (pos: CellPosition, clientX: number, clientY: number) => void;
   /** Called whenever the viewport changes (scroll / zoom / resize). */
   readonly onViewportChange?: () => void;
   /** Called when a column width is changed by dragging. */
@@ -102,6 +105,14 @@ export class SheetRenderer {
   private onColumnResize?: (col: number, width: number) => void;
   private onRowResize?: (row: number, height: number) => void;
   private onSheetMutated?: () => void;
+  private onContextMenu?: (pos: CellPosition, clientX: number, clientY: number) => void;
+
+  /** Range last copied (via Ctrl+C), shown with marching ants border. */
+  private copiedRange: CellRange | null = null;
+  /** Animated dash offset for marching ants, incremented per frame (mod 10). */
+  private dashOffset = 0;
+  /** Queued requestAnimationFrame ID (cancelled on destroy). */
+  private animationFrameId: ReturnType<typeof requestAnimationFrame> | null = null;
 
   /** Column resize drag state. */
   private resizingCol = -1;
@@ -123,6 +134,7 @@ export class SheetRenderer {
   private boundHandleMouseMove: (e: MouseEvent) => void;
   private boundHandleMouseUp: (e: MouseEvent) => void;
   private boundHandleResize: () => void;
+  private boundHandleContextMenu: (e: MouseEvent) => void;
 
   /* Scrollbar drag state. */
   private scrollbarDrag: 'h' | 'v' | null = null;
@@ -146,6 +158,7 @@ export class SheetRenderer {
     this.onColumnResize = config.onColumnResize;
     this.onRowResize = config.onRowResize;
     this.onSheetMutated = config.onSheetMutated;
+    this.onContextMenu = config.onContextMenu;
     this.devicePixelRatio = window.devicePixelRatio || 1;
 
     const ctx = config.canvas.getContext('2d');
@@ -168,6 +181,7 @@ export class SheetRenderer {
     this.boundHandleMouseMove = this.handleMouseMove.bind(this);
     this.boundHandleMouseUp = this.handleMouseUp.bind(this);
     this.boundHandleResize = this.handleResize.bind(this);
+    this.boundHandleContextMenu = this.handleContextMenu.bind(this);
 
     this.setupCanvas();
     this.attachEvents();
@@ -255,6 +269,32 @@ export class SheetRenderer {
   }
 
   /**
+   * Copies the current selection range to the clipboard.
+   * Sets the copied range for marching ants animation.
+   */
+  copySelection(): void {
+    const range = this.getCurrentSelectionRange();
+    if (!range) return;
+    const text = extractCellRangeText(this.sheet, range);
+    this.onCopy?.(text);
+    this.copiedRange = range;
+    this.dashOffset = 0;
+    this.queueRender();
+  }
+
+  /**
+   * Pastes the given text into the sheet starting at the selected cell.
+   * Clears marching ants after pasting.
+   */
+  pasteText(text: string): void {
+    const pos = this.selectedCell;
+    if (!pos) return;
+    const updated = pasteCellRangeText(this.sheet, pos.row, pos.col, text);
+    this.updateSheet(updated);
+    this.copiedRange = null;
+  }
+
+  /**
    * Returns the canvas-pixel rectangle of the given cell.
    * Coordinates are relative to the canvas element.
    */
@@ -283,6 +323,12 @@ export class SheetRenderer {
     window.removeEventListener('mousemove', this.boundHandleMouseMove);
     window.removeEventListener('mouseup', this.boundHandleMouseUp);
     window.removeEventListener('resize', this.boundHandleResize);
+    this.canvas.removeEventListener('contextmenu', this.boundHandleContextMenu);
+    if (this.animationFrameId !== null) {
+      cancelAnimationFrame(this.animationFrameId);
+      this.animationFrameId = null;
+    }
+    this.copiedRange = null;
   }
 
   /* ------------------------------------------------------------------ */
@@ -346,9 +392,45 @@ export class SheetRenderer {
     const pos = this.pixelToCell(x, y);
     if (pos) {
       this.selectedCell = pos;
+      this.copiedRange = null;
       this.onSelectionChange?.(pos);
       this.onEditStart?.();
       this.queueRender();
+    }
+  }
+
+  /**
+   * Handles right-click on the canvas.
+   * Prevents the browser context menu and selects the target cell unless
+   * the click is inside the current selection range (Excel-like behavior).
+   */
+  private handleContextMenu(e: MouseEvent): void {
+    e.preventDefault();
+
+    const rect = this.canvas.getBoundingClientRect();
+    const x = e.clientX - rect.left;
+    const y = e.clientY - rect.top;
+    const pos = this.pixelToCell(x, y);
+
+    if (pos) {
+      /* Only change selection if outside the current range. */
+      const range = this.getCurrentSelectionRange();
+      const inRange =
+        range !== null &&
+        pos.row >= range.startRow &&
+        pos.row <= range.endRow &&
+        pos.col >= range.startCol &&
+        pos.col <= range.endCol;
+
+      if (!inRange) {
+        this.selectedCell = pos;
+        this.selectionAnchor = pos;
+        this.selectionType = 'cell';
+        this.onSelectionChange?.(pos);
+        this.queueRender();
+      }
+
+      this.onContextMenu?.(pos, e.clientX, e.clientY);
     }
   }
 
@@ -364,6 +446,9 @@ export class SheetRenderer {
     /* Ignore shortcuts when focus is on an input (e.g. editing overlay). */
     if (e.target !== this.canvas) return;
 
+    /* Any key press clears marching ants (except Ctrl+C which re-sets it). */
+    this.copiedRange = null;
+
     if (e.key === 'Enter') {
       e.preventDefault();
       if (this.selectedCell) {
@@ -374,6 +459,7 @@ export class SheetRenderer {
 
     if (e.key === 'Escape') {
       this.selectedCell = null;
+      this.copiedRange = null;
       this.onSelectionChange?.(null);
       this.queueRender();
       return;
@@ -387,10 +473,13 @@ export class SheetRenderer {
 
     if ((e.ctrlKey || e.metaKey) && e.key === 'c') {
       e.preventDefault();
-      if (this.selectedCell) {
-        const cell = getCellData(this.sheet, this.selectedCell.row, this.selectedCell.col);
-        const text = cell?.value != null ? String(cell.value) : '';
+      const range = this.getCurrentSelectionRange();
+      if (range) {
+        const text = extractCellRangeText(this.sheet, range);
         this.onCopy?.(text);
+        this.copiedRange = range;
+        this.dashOffset = 0;
+        this.queueRender();
       }
       return;
     }
@@ -398,14 +487,15 @@ export class SheetRenderer {
     if ((e.ctrlKey || e.metaKey) && e.key === 'v') {
       e.preventDefault();
       const pasted = this.onPaste?.();
-      if (pasted !== null && pasted !== undefined && this.selectedCell) {
-        const updated = setCellValue(
+      if (pasted != null && this.selectedCell) {
+        const updated = pasteCellRangeText(
           this.sheet,
           this.selectedCell.row,
           this.selectedCell.col,
           pasted,
         );
         this.updateSheet(updated);
+        this.copiedRange = null;
       }
       return;
     }
@@ -434,6 +524,19 @@ export class SheetRenderer {
     }
   }
 
+  /**
+   * Returns the current selection as a normalized range, or null.
+   */
+  private getCurrentSelectionRange(): SelectionRange | null {
+    if (!this.selectedCell || !this.selectionAnchor) return null;
+    return normalizeRange(
+      this.selectionAnchor.row,
+      this.selectionAnchor.col,
+      this.selectedCell.row,
+      this.selectedCell.col,
+    );
+  }
+
   /** Moves the selected cell by the given delta, clamping to sheet bounds. */
   private moveSelection(dRow: number, dCol: number): void {
     if (!this.selectedCell) {
@@ -454,6 +557,9 @@ export class SheetRenderer {
 
   /** Detects whether a click landed on the horizontal or vertical scrollbar thumb. */
   private handleMouseDown(e: MouseEvent): void {
+    /* Only handle left clicks; right-click goes through contextmenu. */
+    if (e.button !== 0) return;
+
     const rect = this.canvas.getBoundingClientRect();
     const x = e.clientX - rect.left;
     const y = e.clientY - rect.top;
@@ -1006,13 +1112,21 @@ export class SheetRenderer {
   /*  Render Scheduling                                                  */
   /* ------------------------------------------------------------------ */
 
-  /** Queues a render on the next animation frame (deduplicates). */
+  /**
+   * Queues a render on the next animation frame (deduplicates).
+   * When marching ants are active, continuously re-queues to animate.
+   */
   private queueRender(): void {
     if (this.renderQueued) return;
     this.renderQueued = true;
-    requestAnimationFrame(() => {
+    this.animationFrameId = requestAnimationFrame(() => {
       this.renderQueued = false;
+      this.animationFrameId = null;
       this.render();
+      if (this.copiedRange !== null) {
+        this.dashOffset = (this.dashOffset + 1) % 10;
+        this.queueRender();
+      }
     });
   }
 
@@ -1038,6 +1152,7 @@ export class SheetRenderer {
     ctx.scale(zoom, zoom);
     this.renderDataBg();
     this.renderSelection();
+    this.renderMarchingAnts();
     this.renderGridLines();
     this.renderCells();
     ctx.restore();
@@ -1402,15 +1517,46 @@ export class SheetRenderer {
     ctx.fillStyle = '#ffffff';
     ctx.fillRect(activeX, activeY, activeW, activeH);
 
-    /* Border around the entire range. */
-    ctx.strokeStyle = theme.selectionBorder;
-    ctx.lineWidth = 2 / this.viewport.zoom;
-    ctx.strokeRect(rngX, rngY, rngW, rngH);
+    /* Border around the entire range. Skip when marching ants are active
+     * so the dashed line is visible. */
+    if (!this.copiedRange) {
+      ctx.strokeStyle = theme.selectionBorder;
+      ctx.lineWidth = 2 / this.viewport.zoom;
+      ctx.strokeRect(rngX, rngY, rngW, rngH);
+    }
 
     /* Border around the active cell. */
     ctx.strokeStyle = theme.selectionBorder;
     ctx.lineWidth = 2 / this.viewport.zoom;
     ctx.strokeRect(activeX, activeY, activeW, activeH);
+  }
+
+  /* ------------------------------------------------------------------ */
+  /*  Marching Ants (Copied Range Border)                                */
+  /* ------------------------------------------------------------------ */
+
+  /**
+   * Draws a dashed animated border around the last copied range.
+   * The dash offset cycles each frame to create marching ants.
+   */
+  private renderMarchingAnts(): void {
+    if (!this.copiedRange) return;
+
+    const { ctx, theme } = this;
+    const rng = this.copiedRange;
+
+    const x = this.getColumnX(rng.startCol);
+    const y = this.getRowY(rng.startRow);
+    const w = this.getColumnX(rng.endCol) + getColumnWidth(this.sheet, rng.endCol) - x;
+    const h = this.getRowY(rng.endRow) + getRowHeight(this.sheet, rng.endRow) - y;
+
+    ctx.save();
+    ctx.setLineDash([5, 5]);
+    ctx.lineDashOffset = -this.dashOffset;
+    ctx.strokeStyle = theme.selectionBorder;
+    ctx.lineWidth = 2 / this.viewport.zoom;
+    ctx.strokeRect(x, y, w, h);
+    ctx.restore();
   }
 
   /* ------------------------------------------------------------------ */
@@ -1507,6 +1653,7 @@ export class SheetRenderer {
     this.canvas.addEventListener('wheel', this.boundHandleWheel, { passive: false });
     this.canvas.addEventListener('dblclick', this.boundHandleDblClick);
     this.canvas.addEventListener('mousedown', this.boundHandleMouseDown);
+    this.canvas.addEventListener('contextmenu', this.boundHandleContextMenu);
     this.canvas.addEventListener('keydown', this.boundHandleKeyDown);
     window.addEventListener('mousemove', this.boundHandleMouseMove);
     window.addEventListener('mouseup', this.boundHandleMouseUp);

@@ -10,6 +10,14 @@ export interface CellPosition {
 /** All possible value types a cell can hold. */
 export type CellValue = string | number | boolean | null;
 
+/** A rectangular range of cells in the sheet grid. */
+export interface CellRange {
+  readonly startRow: number;
+  readonly startCol: number;
+  readonly endRow: number;
+  readonly endCol: number;
+}
+
 /** Visual/behavioral style applied to a single cell. */
 export interface CellStyle {
   readonly bold?: boolean;

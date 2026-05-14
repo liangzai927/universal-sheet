@@ -24,3 +24,7 @@ body,
   top: 0;
   left: 0;
 }
+
+.us-context-menu-item:hover {
+  background: #e8e8e8 !important;
+}
