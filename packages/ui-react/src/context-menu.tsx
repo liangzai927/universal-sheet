@@ -3,6 +3,7 @@ import { memo, useCallback, useEffect, useRef } from 'react';
 interface ContextMenuProps {
   readonly x: number;
   readonly y: number;
+  readonly onCut?: () => void;
   readonly onCopy?: () => void;
   readonly onPaste?: () => void;
   readonly onClose: () => void;
@@ -15,6 +16,7 @@ interface ContextMenuProps {
 export const ContextMenu = memo(function ContextMenu({
   x,
   y,
+  onCut,
   onCopy,
   onPaste,
   onClose,
@@ -68,6 +70,16 @@ export const ContextMenu = memo(function ContextMenu({
         fontFamily: '-apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif',
       }}
     >
+      <button
+        className="us-context-menu-item"
+        onClick={() => {
+          onCut?.();
+          onClose();
+        }}
+        style={menuItemStyle}
+      >
+        Cut
+      </button>
       <button
         className="us-context-menu-item"
         onClick={() => {

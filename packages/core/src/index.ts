@@ -1,7 +1,7 @@
 // @universal-sheet/core — Pure TypeScript data structures and algorithms.
 // Zero DOM or framework dependencies.
 
-export { extractCellRangeText, pasteCellRangeText } from './clipboard';
+export { clearCellRange, extractCellRangeText, pasteCellRangeText } from './clipboard';
 export {
   createSheetConfig,
   createSheetData,

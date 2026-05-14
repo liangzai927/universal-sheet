@@ -1,5 +1,6 @@
 import type { CellPosition, CellRange, SheetData } from '@universal-sheet/core';
 import {
+  clearCellRange,
   createPosition,
   extractCellRangeText,
   getCellData,
@@ -303,6 +304,23 @@ export class SheetRenderer {
     this.onCopy?.(text);
     this.copiedRange = range;
     this.dashOffset = 0;
+    this.queueRender();
+  }
+
+  /**
+   * Cuts the current selection: copies to clipboard and clears the range.
+   * Shows marching ants on the cut range (same as copy).
+   */
+  cutSelection(): void {
+    const range = this.getCurrentSelectionRange();
+    if (!range) return;
+    const text = extractCellRangeText(this.sheet, range);
+    this.onCopy?.(text);
+    this.copiedRange = range;
+    this.dashOffset = 0;
+    const cleared = clearCellRange(this.sheet, range);
+    this.updateSheet(cleared);
+    this.onSheetMutated?.();
     this.queueRender();
   }
 

@@ -2,6 +2,24 @@ import { getCellData, setCellValue } from './sheet-model';
 import type { CellRange, SheetData } from './types';
 
 /**
+ * Clears all cells in the given range (sets their values to null).
+ * Returns a new SheetData without mutating the original.
+ *
+ * @param sheet - The sheet to clear cells from
+ * @param range - The range of cells to clear
+ * @returns A new SheetData with the range cleared
+ */
+export function clearCellRange(sheet: SheetData, range: CellRange): SheetData {
+  let updated = sheet;
+  for (let r = range.startRow; r <= range.endRow; r++) {
+    for (let c = range.startCol; c <= range.endCol; c++) {
+      updated = setCellValue(updated, r, c, null);
+    }
+  }
+  return updated;
+}
+
+/**
  * Extracts cell values from a range as tab-separated text suitable for the clipboard.
  * Each row is separated by newlines, columns by tabs.
  *

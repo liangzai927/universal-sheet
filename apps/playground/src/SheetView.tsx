@@ -302,6 +302,11 @@ export const SheetView = memo(function SheetView({
           onRedo?.();
           return;
         }
+        if (e.key === 'x' || e.key === 'X') {
+          e.preventDefault();
+          r?.cutSelection();
+          return;
+        }
         if (e.key === 'c') {
           e.preventDefault();
           r?.copySelection();
@@ -389,6 +394,11 @@ export const SheetView = memo(function SheetView({
 
   /* ---- Context menu ---- */
 
+  const handleContextCut = useCallback(() => {
+    rendererRef.current?.cutSelection();
+    setContextMenu(null);
+  }, []);
+
   const handleContextCopy = useCallback(() => {
     rendererRef.current?.copySelection();
     setContextMenu(null);
@@ -471,6 +481,7 @@ export const SheetView = memo(function SheetView({
         <ContextMenu
           x={contextMenu.x}
           y={contextMenu.y}
+          onCut={handleContextCut}
           onCopy={handleContextCopy}
           onPaste={() => {
             void handleContextPaste();
