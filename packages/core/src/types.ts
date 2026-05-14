@@ -22,6 +22,8 @@ export interface CellRange {
 export interface CellStyle {
   readonly bold?: boolean;
   readonly italic?: boolean;
+  readonly underline?: boolean;
+  readonly strikethrough?: boolean;
   readonly fontSize?: number;
   readonly fontFamily?: string;
   readonly color?: string;

@@ -1,4 +1,4 @@
-import type { CellPosition, CellRange, SheetData } from '@universal-sheet/core';
+import type { CellPosition, CellRange, CellStyle, SheetData } from '@universal-sheet/core';
 import {
   clearCellRange,
   createPosition,
@@ -6,9 +6,13 @@ import {
   getCellData,
   getColumnWidth,
   getRowHeight,
+  pasteCellRangeStructured,
   pasteCellRangeText,
+  serializeCellRange,
+  setCellStyle,
   setColumnWidth,
   setRowHeight,
+  tryParseClipboardPayload,
 } from '@universal-sheet/core';
 
 import {
@@ -66,8 +70,8 @@ export interface RendererConfig {
    *  (Enter / double-click). Text input is captured by a proxy element
    *  in the UI layer so IME composition works correctly. */
   readonly onEditStart?: () => void;
-  /** Called on Ctrl+C with the selected range's text value. */
-  readonly onCopy?: (value: string) => void;
+  /** Called on Ctrl+C with the selected range's text value and optional structured JSON. */
+  readonly onCopy?: (value: string, json?: string) => void;
   /** Called on Ctrl+V; the caller should return the text to paste. */
   readonly onPaste?: () => string | null;
   /** Called on right-click with target cell position and mouse client coordinates. */
@@ -100,7 +104,7 @@ export class SheetRenderer {
   private isMouseDownOnGrid = false;
   private onSelectionChange?: (pos: CellPosition | null) => void;
   private onEditStart?: (initial?: string) => void;
-  private onCopy?: (value: string) => void;
+  private onCopy?: (value: string, json?: string) => void;
   private onPaste?: () => string | null;
   private onViewportChange?: () => void;
   private onColumnResize?: (col: number, width: number) => void;
@@ -110,6 +114,8 @@ export class SheetRenderer {
 
   /** Range last copied (via Ctrl+C), shown with marching ants border. */
   private copiedRange: CellRange | null = null;
+  /** Range being cut — cleared on the next paste instead of immediately. */
+  private cutRange: CellRange | null = null;
   /** Animated dash offset for marching ants, incremented per frame (mod 10). */
   private dashOffset = 0;
   /** Queued requestAnimationFrame ID (cancelled on destroy). */
@@ -285,6 +291,24 @@ export class SheetRenderer {
    * Programmatically selects a cell range (for undo/redo after multi-cell
    * operations like paste).
    */
+  /**
+   * Applies a cell style to the current selection or single cell.
+   * For single-cell selections the style goes to that cell; for ranges
+   * the style is applied to every cell in the range.
+   */
+  applyCellStyle(style: Partial<CellStyle>): void {
+    const range = this.getCurrentSelectionRange();
+    if (!range) return;
+    let s = this.sheet;
+    for (let r = range.startRow; r <= range.endRow; r++) {
+      for (let c = range.startCol; c <= range.endCol; c++) {
+        s = setCellStyle(s, r, c, style);
+      }
+    }
+    this.updateSheet(s);
+    this.onSheetMutated?.();
+  }
+
   selectRange(range: CellRange): void {
     this.selectedCell = createPosition(range.endRow, range.endCol);
     this.selectionAnchor = createPosition(range.startRow, range.startCol);
@@ -301,7 +325,8 @@ export class SheetRenderer {
     const range = this.getCurrentSelectionRange();
     if (!range) return;
     const text = extractCellRangeText(this.sheet, range);
-    this.onCopy?.(text);
+    const json = serializeCellRange(this.sheet, range);
+    this.onCopy?.(text, json);
     this.copiedRange = range;
     this.dashOffset = 0;
     this.queueRender();
@@ -315,12 +340,11 @@ export class SheetRenderer {
     const range = this.getCurrentSelectionRange();
     if (!range) return;
     const text = extractCellRangeText(this.sheet, range);
-    this.onCopy?.(text);
+    const json = serializeCellRange(this.sheet, range);
+    this.onCopy?.(text, json);
     this.copiedRange = range;
+    this.cutRange = range; /* Cells stay until paste — Excel-like behavior. */
     this.dashOffset = 0;
-    const cleared = clearCellRange(this.sheet, range);
-    this.updateSheet(cleared);
-    this.onSheetMutated?.();
     this.queueRender();
   }
 
@@ -328,19 +352,39 @@ export class SheetRenderer {
    * Pastes the given text into the sheet starting at the selected cell.
    * Clears marching ants after pasting.
    */
-  pasteText(text: string): void {
+  pasteText(text: string, json?: string, isCut?: boolean): void {
     const pos = this.selectedCell;
     if (!pos) return;
-    const updated = pasteCellRangeText(this.sheet, pos.row, pos.col, text);
+
+    /* If this is a cut-paste, clear the original cut range first. */
+    const cutRng = this.cutRange ?? (isCut ? this.copiedRange : null);
+    if (cutRng) {
+      const cleared = clearCellRange(this.sheet, cutRng);
+      this.updateSheet(cleared);
+      this.sheet = cleared;
+    }
+
+    /* Try structured data first (preserves styles); fall back to plain text. */
+    let updated: SheetData;
+    if (json) {
+      const payload = tryParseClipboardPayload(json);
+      updated = payload
+        ? pasteCellRangeStructured(this.sheet, pos.row, pos.col, payload)
+        : pasteCellRangeText(this.sheet, pos.row, pos.col, text);
+    } else {
+      updated = pasteCellRangeText(this.sheet, pos.row, pos.col, text);
+    }
+
     this.updateSheet(updated);
     this.copiedRange = null;
-    /* Notify the parent so React state stays in sync with the engine. */
+    this.cutRange = null;
     this.onSheetMutated?.();
   }
 
   /** Clears the marching ants copied-range indicator. */
   clearCopiedRange(): void {
     this.copiedRange = null;
+    this.cutRange = null;
     this.queueRender();
   }
 
@@ -379,6 +423,7 @@ export class SheetRenderer {
       this.animationFrameId = null;
     }
     this.copiedRange = null;
+    this.cutRange = null;
   }
 
   /* ------------------------------------------------------------------ */
@@ -443,6 +488,7 @@ export class SheetRenderer {
     if (pos) {
       this.selectedCell = pos;
       this.copiedRange = null;
+      this.cutRange = null;
       this.onSelectionChange?.(pos);
       this.onEditStart?.();
       this.queueRender();
@@ -496,7 +542,8 @@ export class SheetRenderer {
     /* Ignore shortcuts when focus is on an input (e.g. editing overlay). */
     if (e.target !== this.canvas) return;
 
-    /* Any key press clears marching ants (except Ctrl+C which re-sets it). */
+    /* Any key press clears the copy marching ants.
+     * cutRange is NOT cleared — it must survive until paste. */
     this.copiedRange = null;
 
     if (e.key === 'Enter') {
@@ -510,6 +557,7 @@ export class SheetRenderer {
     if (e.key === 'Escape') {
       this.selectedCell = null;
       this.copiedRange = null;
+      this.cutRange = null;
       this.onSelectionChange?.(null);
       this.queueRender();
       return;
@@ -521,12 +569,28 @@ export class SheetRenderer {
       return;
     }
 
+    if ((e.ctrlKey || e.metaKey) && (e.key === 'x' || e.key === 'X')) {
+      e.preventDefault();
+      const range = this.getCurrentSelectionRange();
+      if (range) {
+        const text = extractCellRangeText(this.sheet, range);
+        const json = serializeCellRange(this.sheet, range);
+        this.onCopy?.(text, json);
+        this.copiedRange = range;
+        this.cutRange = range;
+        this.dashOffset = 0;
+        this.queueRender();
+      }
+      return;
+    }
+
     if ((e.ctrlKey || e.metaKey) && e.key === 'c') {
       e.preventDefault();
       const range = this.getCurrentSelectionRange();
       if (range) {
         const text = extractCellRangeText(this.sheet, range);
-        this.onCopy?.(text);
+        const json = serializeCellRange(this.sheet, range);
+        this.onCopy?.(text, json);
         this.copiedRange = range;
         this.dashOffset = 0;
         this.queueRender();
@@ -536,6 +600,12 @@ export class SheetRenderer {
 
     if ((e.ctrlKey || e.metaKey) && e.key === 'v') {
       e.preventDefault();
+      /* Clear cut range first if this is a cut-paste. */
+      if (this.cutRange) {
+        const cleared = clearCellRange(this.sheet, this.cutRange);
+        this.updateSheet(cleared);
+        this.sheet = cleared;
+      }
       const pasted = this.onPaste?.();
       if (pasted != null && this.selectedCell) {
         const updated = pasteCellRangeText(
@@ -546,6 +616,7 @@ export class SheetRenderer {
         );
         this.updateSheet(updated);
         this.copiedRange = null;
+        this.cutRange = null;
         this.onSheetMutated?.();
       }
       return;
@@ -1166,7 +1237,7 @@ export class SheetRenderer {
       this.renderQueued = false;
       this.animationFrameId = null;
       this.render();
-      if (this.copiedRange !== null) {
+      if (this.copiedRange !== null || this.cutRange !== null) {
         this.dashOffset = (this.dashOffset + 1) % 10;
         this.queueRender();
       }
@@ -1194,10 +1265,11 @@ export class SheetRenderer {
     ctx.translate(scrollX, scrollY);
     ctx.scale(zoom, zoom);
     this.renderDataBg();
-    this.renderSelection();
-    this.renderMarchingAnts();
     this.renderGridLines();
+    this.renderSelectionFill();
     this.renderCells();
+    this.renderSelectionBorder();
+    this.renderMarchingAnts();
     ctx.restore();
 
     /* 2. Row headers — sticky left, scrolls vertically. On top of grid. */
@@ -1433,13 +1505,14 @@ export class SheetRenderer {
     const visCols = this.getVisibleCols();
     const visRows = this.getVisibleRows();
 
-    ctx.font = `${theme.cellFontSize}px ${theme.fontFamily}`;
-    ctx.textBaseline = 'middle';
+    const baseFont = theme.cellFontSize;
+    const baseFamily = theme.fontFamily;
 
     for (let r = visRows.firstRow; r <= visRows.lastRow; r++) {
       for (let c = visCols.firstCol; c <= visCols.lastCol; c++) {
         const cell = getCellData(sheet, r, c);
-        if (cell?.value == null) continue;
+        /* Render cells that have a value OR a style (e.g. background color). */
+        if (!cell || (cell.value == null && !cell.style)) continue;
 
         const x = this.getColumnX(c);
         const y = this.getRowY(r);
@@ -1447,9 +1520,24 @@ export class SheetRenderer {
         const rowH = getRowHeight(sheet, r);
 
         const style = cell.style;
-        const align = style?.textAlign ?? 'left';
+
+        /* Background fill. */
+        if (style?.backgroundColor) {
+          ctx.save();
+          ctx.fillStyle = style.backgroundColor;
+          ctx.fillRect(x, y, colW, rowH);
+          ctx.restore();
+        }
+
+        /* Font properties. */
+        const fontSize = style?.fontSize ?? baseFont;
+        const fontFamily = style?.fontFamily ?? baseFamily;
+        const fontWeight = style?.bold ? 'bold' : 'normal';
+        const fontStyle = style?.italic ? 'italic' : 'normal';
+        ctx.font = `${fontStyle} ${fontWeight} ${fontSize}px ${fontFamily}`;
         ctx.fillStyle = style?.color ?? theme.textColor;
 
+        const align = style?.textAlign ?? 'left';
         const padding = 6;
         let textX: number;
         if (align === 'right') {
@@ -1469,16 +1557,45 @@ export class SheetRenderer {
         ctx.rect(x, y, colW, rowH);
         ctx.clip();
 
-        const text = cell.displayValue ?? String(cell.value);
+        const text = cell.value != null ? (cell.displayValue ?? String(cell.value)) : '';
+        if (text.length === 0) {
+          ctx.restore();
+          continue;
+        }
         const lines = text.split('\n');
-        const lineHeight = theme.cellFontSize * 1.4;
-        const firstLineY = y + padding + theme.cellFontSize * 0.7;
+        const lineHeight = fontSize * 1.4;
+        const firstLineY = y + padding + fontSize * 0.7;
 
         ctx.textBaseline = 'alphabetic';
         for (let li = 0; li < lines.length; li++) {
           const lineY = firstLineY + li * lineHeight;
-          if (lineY > y + rowH) break; // stop if beyond cell bounds
-          ctx.fillText(lines[li] ?? '', textX, lineY);
+          if (lineY > y + rowH) break;
+          const lineText = lines[li] ?? '';
+          ctx.fillText(lineText, textX, lineY);
+          if (lineText.length === 0) continue;
+
+          const tw = ctx.measureText(lineText).width;
+          /* Compute the leftmost x of the text based on alignment. */
+          let leftX: number;
+          if (align === 'center') {
+            leftX = textX - tw / 2;
+          } else if (align === 'right') {
+            leftX = textX - tw;
+          } else {
+            leftX = textX;
+          }
+
+          const drawLine = (offsetY: number) => {
+            ctx.strokeStyle = ctx.fillStyle;
+            ctx.lineWidth = 1;
+            ctx.beginPath();
+            ctx.moveTo(leftX, offsetY);
+            ctx.lineTo(leftX + tw, offsetY);
+            ctx.stroke();
+          };
+
+          if (style?.underline) drawLine(lineY + 2);
+          if (style?.strikethrough) drawLine(lineY - fontSize * 0.3);
         }
         ctx.restore();
       }
@@ -1489,7 +1606,7 @@ export class SheetRenderer {
   /*  Selection Highlight                                                */
   /* ------------------------------------------------------------------ */
 
-  private renderSelection(): void {
+  private renderSelectionFill(): void {
     if (!this.selectedCell || !this.selectionAnchor) return;
 
     const { ctx, theme } = this;
@@ -1539,7 +1656,7 @@ export class SheetRenderer {
       return;
     }
 
-    /* Range / single cell selection. */
+    /* Range / single cell selection — fill only (borders drawn on top). */
     const rng = normalizeRange(this.selectionAnchor.row, this.selectionAnchor.col, row, col);
 
     const rngX = this.getColumnX(rng.startCol);
@@ -1551,7 +1668,7 @@ export class SheetRenderer {
     ctx.fillStyle = theme.selectionBg;
     ctx.fillRect(rngX, rngY, rngW, rngH);
 
-    /* Draw the active cell in white with a blue border. */
+    /* Draw the active cell in white. */
     const activeX = this.getColumnX(col);
     const activeY = this.getRowY(row);
     const activeW = getColumnWidth(this.sheet, col);
@@ -1559,16 +1676,34 @@ export class SheetRenderer {
 
     ctx.fillStyle = '#ffffff';
     ctx.fillRect(activeX, activeY, activeW, activeH);
+  }
 
-    /* Border around the entire range. Skip when marching ants are active
-     * so the dashed line is visible. */
-    if (!this.copiedRange) {
+  private renderSelectionBorder(): void {
+    if (!this.selectedCell || !this.selectionAnchor) return;
+    if (this.selectionType !== 'cell') return;
+
+    const { ctx, theme } = this;
+    const { row, col } = this.selectedCell;
+    const rng = normalizeRange(this.selectionAnchor.row, this.selectionAnchor.col, row, col);
+
+    const rngX = this.getColumnX(rng.startCol);
+    const rngY = this.getRowY(rng.startRow);
+    const rngW = this.getColumnX(rng.endCol) + getColumnWidth(this.sheet, rng.endCol) - rngX;
+    const rngH = this.getRowY(rng.endRow) + getRowHeight(this.sheet, rng.endRow) - rngY;
+
+    /* Border around the entire range. Skip when marching ants are active. */
+    if (!this.copiedRange && !this.cutRange) {
       ctx.strokeStyle = theme.selectionBorder;
       ctx.lineWidth = 2 / this.viewport.zoom;
       ctx.strokeRect(rngX, rngY, rngW, rngH);
     }
 
     /* Border around the active cell. */
+    const activeX = this.getColumnX(col);
+    const activeY = this.getRowY(row);
+    const activeW = getColumnWidth(this.sheet, col);
+    const activeH = getRowHeight(this.sheet, row);
+
     ctx.strokeStyle = theme.selectionBorder;
     ctx.lineWidth = 2 / this.viewport.zoom;
     ctx.strokeRect(activeX, activeY, activeW, activeH);
@@ -1583,10 +1718,10 @@ export class SheetRenderer {
    * The dash offset cycles each frame to create marching ants.
    */
   private renderMarchingAnts(): void {
-    if (!this.copiedRange) return;
+    const rng = this.copiedRange ?? this.cutRange;
+    if (!rng) return;
 
     const { ctx, theme } = this;
-    const rng = this.copiedRange;
 
     const x = this.getColumnX(rng.startCol);
     const y = this.getRowY(rng.startRow);

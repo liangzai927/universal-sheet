@@ -1,6 +1,7 @@
 import {
   type CellData,
   cellKey,
+  type CellStyle,
   type ColumnData,
   DEFAULT_SHEET_CONFIG,
   type RowData,
@@ -104,4 +105,24 @@ export function setRowHeight(sheet: SheetData, row: number, height: number): She
   const existing = next.get(row);
   next.set(row, { height, hidden: existing?.hidden });
   return { ...sheet, rows: next };
+}
+
+/**
+ * Merges style properties onto a cell. If the cell doesn't exist yet,
+ * creates it with a null value. Returns a new SheetData.
+ */
+export function setCellStyle(
+  sheet: SheetData,
+  row: number,
+  col: number,
+  style: Partial<CellStyle>,
+): SheetData {
+  const next = new Map(sheet.cells);
+  const key = cellKey(row, col);
+  const existing = next.get(key);
+  const data: CellData = existing
+    ? { ...existing, style: { ...existing.style, ...style } }
+    : { value: null, style };
+  next.set(key, data);
+  return { ...sheet, cells: next };
 }

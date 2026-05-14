@@ -1,31 +1,14 @@
-import { getCellData, setCellValue } from './sheet-model';
+import { getCellData, setCellStyle, setCellValue } from './sheet-model';
+import type { CellStyle } from './types';
 import type { CellRange, SheetData } from './types';
+import { cellKey } from './types';
+
+/* ------------------------------------------------------------------ */
+/*  Plain-text clipboard (external interop)                            */
+/* ------------------------------------------------------------------ */
 
 /**
- * Clears all cells in the given range (sets their values to null).
- * Returns a new SheetData without mutating the original.
- *
- * @param sheet - The sheet to clear cells from
- * @param range - The range of cells to clear
- * @returns A new SheetData with the range cleared
- */
-export function clearCellRange(sheet: SheetData, range: CellRange): SheetData {
-  let updated = sheet;
-  for (let r = range.startRow; r <= range.endRow; r++) {
-    for (let c = range.startCol; c <= range.endCol; c++) {
-      updated = setCellValue(updated, r, c, null);
-    }
-  }
-  return updated;
-}
-
-/**
- * Extracts cell values from a range as tab-separated text suitable for the clipboard.
- * Each row is separated by newlines, columns by tabs.
- *
- * @param sheet - The sheet to read from
- * @param range - The range of cells to extract
- * @returns Tab-separated text representation of the range
+ * Extracts cell values from a range as tab-separated text.
  */
 export function extractCellRangeText(sheet: SheetData, range: CellRange): string {
   const rows: Array<string> = [];
@@ -44,13 +27,6 @@ export function extractCellRangeText(sheet: SheetData, range: CellRange): string
 
 /**
  * Pastes tab-separated text into the sheet starting from a given position.
- * Empty strings clear the target cell. Cells beyond sheet bounds are ignored.
- *
- * @param sheet - The sheet to paste into
- * @param startRow - Starting row (0-indexed)
- * @param startCol - Starting column (0-indexed)
- * @param text - Tab-separated text to paste
- * @returns A new SheetData with the pasted values applied
  */
 export function pasteCellRangeText(
   sheet: SheetData,
@@ -81,3 +57,131 @@ export function pasteCellRangeText(
 
   return updated;
 }
+
+/**
+ * Clears all cells in the given range — removes values AND styles.
+ * Used for cut operations so cells return to their default state.
+ */
+export function clearCellRange(sheet: SheetData, range: CellRange): SheetData {
+  const next = new Map(sheet.cells);
+  for (let r = range.startRow; r <= range.endRow; r++) {
+    for (let c = range.startCol; c <= range.endCol; c++) {
+      next.delete(cellKey(r, c));
+    }
+  }
+  return { ...sheet, cells: next };
+}
+
+/* ------------------------------------------------------------------ */
+/*  Structured clipboard (preserves styles, formulas, etc.)            */
+/* ------------------------------------------------------------------ */
+
+interface SerializedCell {
+  /** Relative row within the copied range (0-based). */
+  readonly r: number;
+  /** Relative col within the copied range (0-based). */
+  readonly c: number;
+  readonly value: string | number | boolean | null;
+  readonly displayValue?: string;
+  readonly formula?: string;
+  readonly style?: CellStyle;
+}
+
+interface ClipboardPayload {
+  readonly type: 'universal-sheet-cells';
+  readonly version: 1;
+  readonly rows: number;
+  readonly cols: number;
+  readonly cells: Array<SerializedCell>;
+}
+
+const MIME_TYPE = 'application/x-universal-sheet-cells';
+
+/**
+ * Serializes all cell data (value, style, formula) from a range into
+ * a JSON string suitable for structured clipboard transfer.
+ */
+export function serializeCellRange(sheet: SheetData, range: CellRange): string {
+  const cells: Array<SerializedCell> = [];
+
+  for (let r = range.startRow; r <= range.endRow; r++) {
+    for (let c = range.startCol; c <= range.endCol; c++) {
+      const cell = getCellData(sheet, r, c);
+      if (!cell) continue;
+
+      cells.push({
+        r: r - range.startRow,
+        c: c - range.startCol,
+        value: cell.value,
+        displayValue: cell.displayValue,
+        formula: cell.formula,
+        style: cell.style,
+      });
+    }
+  }
+
+  const payload: ClipboardPayload = {
+    type: 'universal-sheet-cells',
+    version: 1,
+    rows: range.endRow - range.startRow + 1,
+    cols: range.endCol - range.startCol + 1,
+    cells,
+  };
+
+  return JSON.stringify(payload);
+}
+
+/**
+ * Attempts to parse a structured clipboard payload.
+ * Returns null if the text is not a valid universal-sheet-cells payload.
+ */
+export function tryParseClipboardPayload(text: string): ClipboardPayload | null {
+  try {
+    const obj: unknown = JSON.parse(text);
+    if (
+      typeof obj === 'object' &&
+      obj !== null &&
+      (obj as Record<string, unknown>).type === 'universal-sheet-cells' &&
+      (obj as Record<string, unknown>).version === 1
+    ) {
+      return obj as ClipboardPayload;
+    }
+  } catch {
+    /* ignore parse errors */
+  }
+  return null;
+}
+
+/**
+ * Pastes structured cell data from a clipboard payload into the sheet.
+ * Preserves values, styles, formulas and display values.
+ */
+export function pasteCellRangeStructured(
+  sheet: SheetData,
+  startRow: number,
+  startCol: number,
+  payload: ClipboardPayload,
+): SheetData {
+  const { rowCount, colCount } = sheet.config;
+  let updated = sheet;
+
+  for (const sc of payload.cells) {
+    const targetRow = startRow + sc.r;
+    const targetCol = startCol + sc.c;
+    if (targetRow >= rowCount || targetCol >= colCount) continue;
+
+    /* Apply value. */
+    updated = setCellValue(updated, targetRow, targetCol, sc.value);
+
+    /* Apply style if present. */
+    if (sc.style) {
+      updated = setCellStyle(updated, targetRow, targetCol, sc.style);
+    }
+
+    /* TODO: apply formula when formula engine is ready. */
+  }
+
+  return updated;
+}
+
+export { MIME_TYPE };

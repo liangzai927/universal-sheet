@@ -1,8 +1,9 @@
-import type { CellPosition, SheetData } from '@universal-sheet/core';
+import type { CellPosition, CellStyle, SheetData } from '@universal-sheet/core';
 import {
   createSheetData,
   getCellData,
   getRowHeight,
+  MIME_TYPE,
   setCellValue,
   setColumnWidth as setColW,
   setRowHeight,
@@ -63,6 +64,7 @@ export const SheetView = memo(function SheetView({
     width: number;
     height: number;
     value: string;
+    style?: CellStyle;
   } | null>(null);
 
   const [contextMenu, setContextMenu] = useState<{
@@ -75,7 +77,7 @@ export const SheetView = memo(function SheetView({
   const sheetDataRef = useRef(sheetData);
   sheetDataRef.current = sheetData;
 
-  const copyBuffer = useRef('');
+  const copyBuffer = useRef<{ text: string; json?: string; isCut?: boolean }>({ text: '' });
 
   /* ---- Start / commit / cancel editing ---- */
 
@@ -83,13 +85,18 @@ export const SheetView = memo(function SheetView({
     const renderer = rendererRef.current;
     if (!renderer) return;
     const rect = renderer.getCellRect(pos.row, pos.col);
-    const value =
-      initial ??
-      (() => {
-        const cell = getCellData(sheetDataRef.current, pos.row, pos.col);
-        return cell?.value != null ? String(cell.value) : '';
-      })();
-    setEditState({ pos, x: rect.x, y: rect.y, width: rect.width, height: rect.height, value });
+    const cell = getCellData(sheetDataRef.current, pos.row, pos.col);
+    const value = initial ?? (cell?.value != null ? String(cell.value) : '');
+    setEditState({
+      pos,
+      x: rect.x,
+      y: rect.y,
+      width: rect.width,
+      height: rect.height,
+      value,
+      style: cell?.style,
+    });
+    rendererRef.current?.clearCopiedRange();
   }, []);
 
   const commitEdit = useCallback(() => {
@@ -157,11 +164,28 @@ export const SheetView = memo(function SheetView({
         const pos = renderer.getSelectedCell();
         if (pos) startEdit(pos);
       },
-      onCopy: (value) => {
-        copyBuffer.current = value;
-        navigator.clipboard.writeText(value).catch(noop);
+      onCopy: (value, json) => {
+        copyBuffer.current = { text: value, json };
+        /* Write to system clipboard. Prefer structured data with fallback to plain text. */
+        try {
+          if (json) {
+            navigator.clipboard
+              .write([
+                new ClipboardItem({
+                  'text/plain': new Blob([value], { type: 'text/plain' }),
+                  [MIME_TYPE]: new Blob([json], { type: MIME_TYPE }),
+                }),
+              ])
+              .catch(() => navigator.clipboard.writeText(value).catch(noop));
+          } else {
+            navigator.clipboard.writeText(value).catch(noop);
+          }
+        } catch {
+          /* ClipboardItem with custom MIME may not be supported; fallback. */
+          navigator.clipboard.writeText(value).catch(noop);
+        }
       },
-      onPaste: () => copyBuffer.current,
+      onPaste: () => copyBuffer.current.text || null,
       onContextMenu: (pos, clientX, clientY) => {
         setContextMenu({ pos, x: clientX, y: clientY });
       },
@@ -282,8 +306,9 @@ export const SheetView = memo(function SheetView({
     (e: React.KeyboardEvent<HTMLInputElement>) => {
       const r = rendererRef.current;
 
-      /* Any key press clears marching ants (except Ctrl+C which re-sets it). */
-      if (!(e.ctrlKey || e.metaKey) || e.key !== 'c') {
+      /* Clear marching ants on Escape or when starting an edit;
+       * navigation keys (arrows, Enter, Tab) preserve the cut/copy range. */
+      if (e.key === 'Escape') {
         r?.clearCopiedRange();
       }
 
@@ -304,23 +329,37 @@ export const SheetView = memo(function SheetView({
         }
         if (e.key === 'x' || e.key === 'X') {
           e.preventDefault();
+          copyBuffer.current.isCut = true;
           r?.cutSelection();
           return;
         }
         if (e.key === 'c') {
           e.preventDefault();
+          copyBuffer.current.isCut = false;
           r?.copySelection();
           return;
         }
         if (e.key === 'v') {
           e.preventDefault();
           void (async () => {
+            /* Prefer structured data from system clipboard, fallback to internal buffer. */
+            let text = copyBuffer.current.text;
+            let json = copyBuffer.current.json;
             try {
-              const text = await navigator.clipboard.readText();
-              if (text) r?.pasteText(text);
+              const items = await navigator.clipboard.read();
+              for (const item of items) {
+                if (item.types.includes(MIME_TYPE)) {
+                  json = await (await item.getType(MIME_TYPE)).text();
+                }
+                if (item.types.includes('text/plain')) {
+                  text = await (await item.getType('text/plain')).text();
+                }
+              }
             } catch {
-              if (copyBuffer.current) r?.pasteText(copyBuffer.current);
+              /* Clipboard API failed — use internal buffer (already set above). */
             }
+            const isCut = copyBuffer.current.isCut;
+            if (text || json) r?.pasteText(text, json, isCut);
           })();
           return;
         }
@@ -357,6 +396,7 @@ export const SheetView = memo(function SheetView({
       }
       if (e.key === 'Delete' || e.key === 'Backspace') {
         e.preventDefault();
+        r?.clearCopiedRange();
         const pos = r?.getSelectedCell();
         if (pos) {
           const cell = getCellData(sheetDataRef.current, pos.row, pos.col);
@@ -395,6 +435,7 @@ export const SheetView = memo(function SheetView({
   /* ---- Context menu ---- */
 
   const handleContextCut = useCallback(() => {
+    copyBuffer.current.isCut = true;
     rendererRef.current?.cutSelection();
     setContextMenu(null);
   }, []);
@@ -405,12 +446,22 @@ export const SheetView = memo(function SheetView({
   }, []);
 
   const handleContextPaste = useCallback(async () => {
+    let text = copyBuffer.current.text;
+    let json = copyBuffer.current.json;
     try {
-      const text = await navigator.clipboard.readText();
-      if (text) rendererRef.current?.pasteText(text);
+      const items = await navigator.clipboard.read();
+      for (const item of items) {
+        if (item.types.includes(MIME_TYPE)) {
+          json = await (await item.getType(MIME_TYPE)).text();
+        }
+        if (item.types.includes('text/plain')) {
+          text = await (await item.getType('text/plain')).text();
+        }
+      }
     } catch {
-      if (copyBuffer.current) rendererRef.current?.pasteText(copyBuffer.current);
+      /* use internal buffer */
     }
+    if (text || json) rendererRef.current?.pasteText(text, json, copyBuffer.current.isCut);
     setContextMenu(null);
   }, []);
 
@@ -465,9 +516,22 @@ export const SheetView = memo(function SheetView({
             padding: '2px 4px',
             border: '2px solid #1a73e8',
             outline: 'none',
-            fontSize: 13,
-            fontFamily: '-apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif',
-            background: '#fff',
+            fontSize: editState.style?.fontSize ?? 13,
+            fontFamily:
+              editState.style?.fontFamily ??
+              '-apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif',
+            fontWeight: editState.style?.bold ? 'bold' : 'normal',
+            fontStyle: editState.style?.italic ? 'italic' : 'normal',
+            textDecoration:
+              [
+                editState.style?.underline ? 'underline' : '',
+                editState.style?.strikethrough ? 'line-through' : '',
+              ]
+                .filter(Boolean)
+                .join(' ') || 'none',
+            color: editState.style?.color ?? '#1a1a1a',
+            background: editState.style?.backgroundColor ?? '#fff',
+            textAlign: editState.style?.textAlign ?? 'left',
             boxSizing: 'border-box',
             zIndex: 10,
             resize: 'none',
