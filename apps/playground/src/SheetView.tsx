@@ -1,7 +1,9 @@
 import type { CellPosition, CellStyle, SheetData } from '@universal-sheet/core';
 import {
+  clearCellRange,
   createSheetData,
   getCellData,
+  getMergeByAnchor,
   getRowHeight,
   MIME_TYPE,
   setCellValue,
@@ -26,6 +28,10 @@ interface SheetViewProps {
   readonly onUndo?: () => void;
   /** Called on Ctrl+Y (or Ctrl+Shift+Z). */
   readonly onRedo?: () => void;
+  /** Called when the user requests merge/unmerge from the context menu. */
+  readonly onMerge?: () => void;
+  /** Whether the current selection is a merged cell. */
+  readonly isMerged?: boolean;
 }
 
 /**
@@ -44,6 +50,8 @@ export const SheetView = memo(function SheetView({
   onSheetChange,
   onUndo,
   onRedo,
+  onMerge,
+  isMerged,
 }: SheetViewProps) {
   const canvasRef = useRef<HTMLCanvasElement>(null);
   const inputRef = useRef<HTMLTextAreaElement>(null);
@@ -399,11 +407,19 @@ export const SheetView = memo(function SheetView({
         r?.clearCopiedRange();
         const pos = r?.getSelectedCell();
         if (pos) {
-          const cell = getCellData(sheetDataRef.current, pos.row, pos.col);
-          if (cell?.value == null) return; /* Already empty — no-op. */
-          const updated = setCellValue(sheetDataRef.current, pos.row, pos.col, null);
-          r?.updateSheet(updated);
-          onCellChange?.(updated, pos, '');
+          const merge = getMergeByAnchor(sheetDataRef.current, pos.row, pos.col);
+          if (merge) {
+            /* Clear the entire merged range. */
+            const updated = clearCellRange(sheetDataRef.current, merge);
+            r?.updateSheet(updated);
+            onSheetChange?.(updated);
+          } else {
+            const cell = getCellData(sheetDataRef.current, pos.row, pos.col);
+            if (cell?.value == null) return; /* Already empty — no-op. */
+            const updated = setCellValue(sheetDataRef.current, pos.row, pos.col, null);
+            r?.updateSheet(updated);
+            onCellChange?.(updated, pos, '');
+          }
         }
         return;
       }
@@ -550,6 +566,8 @@ export const SheetView = memo(function SheetView({
           onPaste={() => {
             void handleContextPaste();
           }}
+          onMerge={onMerge}
+          isMerged={isMerged}
           onClose={() => {
             setContextMenu(null);
           }}

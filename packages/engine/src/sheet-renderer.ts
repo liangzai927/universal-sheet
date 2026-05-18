@@ -5,6 +5,8 @@ import {
   extractCellRangeText,
   getCellData,
   getColumnWidth,
+  getMergeAt,
+  getMergeByAnchor,
   getRowHeight,
   pasteCellRangeStructured,
   pasteCellRangeText,
@@ -309,6 +311,13 @@ export class SheetRenderer {
     this.onSheetMutated?.();
   }
 
+  /**
+   * Returns true if the given cell is the anchor of a merged range.
+   */
+  isMergedCell(row: number, col: number): boolean {
+    return getMergeByAnchor(this.sheet, row, col) !== null;
+  }
+
   selectRange(range: CellRange): void {
     this.selectedCell = createPosition(range.endRow, range.endCol);
     this.selectionAnchor = createPosition(range.startRow, range.startCol);
@@ -391,11 +400,21 @@ export class SheetRenderer {
   /**
    * Returns the canvas-pixel rectangle of the given cell.
    * Coordinates are relative to the canvas element.
+   * For merged-cell anchors the rectangle spans the entire merge area.
    */
   getCellRect(row: number, col: number): CellRect {
     const { zoom, scrollX, scrollY } = this.viewport;
-    const colW = getColumnWidth(this.sheet, col);
-    const rowH = getRowHeight(this.sheet, row);
+
+    const merge = getMergeByAnchor(this.sheet, row, col);
+    let colW: number;
+    let rowH: number;
+    if (merge) {
+      colW = this.getMergedWidth(merge);
+      rowH = this.getMergedHeight(merge);
+    } else {
+      colW = getColumnWidth(this.sheet, col);
+      rowH = getRowHeight(this.sheet, row);
+    }
 
     const worldX = this.getColumnX(col);
     const worldY = this.getRowY(row);
@@ -639,7 +658,7 @@ export class SheetRenderer {
   /**
    * Returns the current selection as a normalized range, or null.
    */
-  private getCurrentSelectionRange(): SelectionRange | null {
+  getCurrentSelectionRange(): SelectionRange | null {
     if (!this.selectedCell || !this.selectionAnchor) return null;
     return normalizeRange(
       this.selectionAnchor.row,
@@ -649,14 +668,46 @@ export class SheetRenderer {
     );
   }
 
-  /** Moves the selected cell by the given delta, clamping to sheet bounds. */
+  /** Moves the selected cell by the given delta, clamping to sheet bounds.
+   *  If the current cell is a merged-cell anchor, arrow keys jump to the
+   *  cell just outside the merge area. */
   private moveSelection(dRow: number, dCol: number): void {
     if (!this.selectedCell) {
       this.selectedCell = createPosition(0, 0);
     } else {
       const { row, col } = this.selectedCell;
-      const newRow = Math.max(0, Math.min(this.sheet.config.rowCount - 1, row + dRow));
-      const newCol = Math.max(0, Math.min(this.sheet.config.colCount - 1, col + dCol));
+      const merge = getMergeByAnchor(this.sheet, row, col);
+      let startRow = row;
+      let startCol = col;
+      let endRow = row;
+      let endCol = col;
+
+      if (merge) {
+        startRow = merge.startRow;
+        startCol = merge.startCol;
+        endRow = merge.endRow;
+        endCol = merge.endCol;
+      }
+
+      let newRow: number;
+      let newCol: number;
+
+      if (dRow > 0) {
+        newRow = Math.min(this.sheet.config.rowCount - 1, endRow + dRow);
+      } else if (dRow < 0) {
+        newRow = Math.max(0, startRow + dRow);
+      } else {
+        newRow = row;
+      }
+
+      if (dCol > 0) {
+        newCol = Math.min(this.sheet.config.colCount - 1, endCol + dCol);
+      } else if (dCol < 0) {
+        newCol = Math.max(0, startCol + dCol);
+      } else {
+        newCol = col;
+      }
+
       this.selectedCell = createPosition(newRow, newCol);
     }
     /* Reset anchor so the selection collapses to a single cell (Excel-like). */
@@ -783,8 +834,20 @@ export class SheetRenderer {
         /* Click on grid → select cell / start range drag. */
         const cellPos = this.pixelToCell(x, y);
         this.selectionType = 'cell';
-        this.selectedCell = cellPos;
-        this.selectionAnchor = cellPos;
+        if (cellPos) {
+          const merge = getMergeByAnchor(this.sheet, cellPos.row, cellPos.col);
+          if (merge) {
+            /* Select the full merged range. */
+            this.selectionAnchor = createPosition(merge.startRow, merge.startCol);
+            this.selectedCell = createPosition(merge.endRow, merge.endCol);
+          } else {
+            this.selectedCell = cellPos;
+            this.selectionAnchor = cellPos;
+          }
+        } else {
+          this.selectedCell = null;
+          this.selectionAnchor = null;
+        }
         this.isMouseDownOnGrid = cellPos !== null;
       }
     }
@@ -853,14 +916,24 @@ export class SheetRenderer {
     if (this.isMouseDownOnGrid && this.selectionAnchor) {
       if (this.selectionType === 'cell') {
         const cellPos = this.pixelToCell(x, y);
-        if (
-          cellPos &&
-          this.selectedCell &&
-          (cellPos.row !== this.selectedCell.row || cellPos.col !== this.selectedCell.col)
-        ) {
-          this.selectedCell = cellPos;
-          this.onSelectionChange?.(cellPos);
-          this.queueRender();
+        if (cellPos && this.selectedCell) {
+          /* Normalize to merge anchors so dragging within the same merged
+           * cell doesn't shrink the selection to the anchor. */
+          const curMerge = this.getMergeAt(this.selectedCell.row, this.selectedCell.col);
+          const curPos = curMerge
+            ? createPosition(curMerge.startRow, curMerge.startCol)
+            : this.selectedCell;
+
+          const newMerge = this.getMergeAt(cellPos.row, cellPos.col);
+          const newPos = newMerge
+            ? createPosition(newMerge.startRow, newMerge.startCol)
+            : cellPos;
+
+          if (newPos.row !== curPos.row || newPos.col !== curPos.col) {
+            this.selectedCell = cellPos;
+            this.onSelectionChange?.(cellPos);
+            this.queueRender();
+          }
         }
       } else if (this.selectionType === 'column') {
         const col = this.isInColumnHeader(x, y);
@@ -980,6 +1053,12 @@ export class SheetRenderer {
       accY += rh;
     }
     if (row < 0) return null;
+
+    /* If the click falls inside a merged cell, return the anchor (top-left). */
+    const merge = this.getMergeAt(row, col);
+    if (merge) {
+      return createPosition(merge.startRow, merge.startCol);
+    }
 
     return createPosition(row, col);
   }
@@ -1116,6 +1195,49 @@ export class SheetRenderer {
       canvasY >= 0 &&
       canvasY <= headerRowHeight * zoom
     );
+  }
+
+  /* ------------------------------------------------------------------ */
+  /*  Merge Cell Helpers                                                 */
+  /* ------------------------------------------------------------------ */
+
+  /**
+   * Returns the merge range that contains the given cell, or null.
+   */
+  private getMergeAt(row: number, col: number): CellRange | null {
+    for (const rng of this.sheet.merges.values()) {
+      if (
+        row >= rng.startRow &&
+        row <= rng.endRow &&
+        col >= rng.startCol &&
+        col <= rng.endCol
+      ) {
+        return rng;
+      }
+    }
+    return null;
+  }
+
+  /**
+   * Returns the total width of a merged cell range (sum of column widths).
+   */
+  private getMergedWidth(rng: CellRange): number {
+    let w = 0;
+    for (let c = rng.startCol; c <= rng.endCol; c++) {
+      w += getColumnWidth(this.sheet, c);
+    }
+    return w;
+  }
+
+  /**
+   * Returns the total height of a merged cell range (sum of row heights).
+   */
+  private getMergedHeight(rng: CellRange): number {
+    let h = 0;
+    for (let r = rng.startRow; r <= rng.endRow; r++) {
+      h += getRowHeight(this.sheet, r);
+    }
+    return h;
   }
 
   /* ------------------------------------------------------------------ */
@@ -1476,23 +1598,72 @@ export class SheetRenderer {
     ctx.strokeStyle = theme.gridLine;
     ctx.lineWidth = 1 / this.viewport.zoom;
 
-    // Vertical lines at each column boundary
+    /* Draw vertical lines segment-by-segment so we can skip parts
+       that fall inside merged cells. */
     ctx.beginPath();
     for (let c = visCols.firstCol; c <= visCols.lastCol + 1; c++) {
       const x = this.getColumnX(c);
-      ctx.moveTo(x, headerRowHeight);
-      ctx.lineTo(x, totalH);
+      for (let r = visRows.firstRow; r < visRows.lastRow + 1; r++) {
+        const y0 = this.getRowY(r);
+        const y1 = this.getRowY(r + 1);
+        if (this.isVerticalLineInsideMerge(r, c)) continue;
+        ctx.moveTo(x, y0);
+        ctx.lineTo(x, y1);
+      }
     }
     ctx.stroke();
 
-    // Horizontal lines at each row boundary
+    /* Draw horizontal lines segment-by-segment. */
     ctx.beginPath();
     for (let r = visRows.firstRow; r <= visRows.lastRow + 1; r++) {
       const y = this.getRowY(r);
-      ctx.moveTo(headerColWidth, y);
-      ctx.lineTo(totalW, y);
+      for (let c = visCols.firstCol; c < visCols.lastCol + 1; c++) {
+        const x0 = this.getColumnX(c);
+        const x1 = this.getColumnX(c + 1);
+        if (this.isHorizontalLineInsideMerge(r, c)) continue;
+        ctx.moveTo(x0, y);
+        ctx.lineTo(x1, y);
+      }
     }
     ctx.stroke();
+  }
+
+  /**
+   * Returns true if the vertical grid line at column boundary `colBoundary`
+   * within row `row` is inside a merged cell (and should therefore not be drawn).
+   * `colBoundary` is the column index whose left edge forms the line.
+   */
+  private isVerticalLineInsideMerge(row: number, colBoundary: number): boolean {
+    for (const rng of this.sheet.merges.values()) {
+      if (
+        row >= rng.startRow &&
+        row <= rng.endRow &&
+        colBoundary > rng.startCol &&
+        colBoundary <= rng.endCol
+      ) {
+        return true;
+      }
+    }
+    return false;
+  }
+
+  /**
+   * Returns true if the horizontal grid line at row boundary `rowBoundary`
+   * within column `col` is inside a merged cell (and should therefore not be drawn).
+   * `rowBoundary` is the row index whose top edge forms the line.
+   */
+  private isHorizontalLineInsideMerge(rowBoundary: number, col: number): boolean {
+    for (const rng of this.sheet.merges.values()) {
+      if (
+        col >= rng.startCol &&
+        col <= rng.endCol &&
+        rowBoundary > rng.startRow &&
+        rowBoundary <= rng.endRow
+      ) {
+        return true;
+      }
+    }
+    return false;
   }
 
   /* ------------------------------------------------------------------ */
@@ -1511,13 +1682,24 @@ export class SheetRenderer {
     for (let r = visRows.firstRow; r <= visRows.lastRow; r++) {
       for (let c = visCols.firstCol; c <= visCols.lastCol; c++) {
         const cell = getCellData(sheet, r, c);
+        /* Skip non-anchor cells that are part of a merge. */
+        const merge = this.getMergeAt(r, c);
+        if (merge && (r !== merge.startRow || c !== merge.startCol)) continue;
+
         /* Render cells that have a value OR a style (e.g. background color). */
         if (!cell || (cell.value == null && !cell.style)) continue;
 
         const x = this.getColumnX(c);
         const y = this.getRowY(r);
-        const colW = getColumnWidth(sheet, c);
-        const rowH = getRowHeight(sheet, r);
+        let colW: number;
+        let rowH: number;
+        if (merge) {
+          colW = this.getMergedWidth(merge);
+          rowH = this.getMergedHeight(merge);
+        } else {
+          colW = getColumnWidth(sheet, c);
+          rowH = getRowHeight(sheet, r);
+        }
 
         const style = cell.style;
 
@@ -1693,16 +1875,6 @@ export class SheetRenderer {
       ctx.lineWidth = 2 / this.viewport.zoom;
       ctx.strokeRect(rngX, rngY, rngW, rngH);
     }
-
-    /* Border around the active cell. */
-    const activeX = this.getColumnX(col);
-    const activeY = this.getRowY(row);
-    const activeW = getColumnWidth(this.sheet, col);
-    const activeH = getRowHeight(this.sheet, row);
-
-    ctx.strokeStyle = theme.selectionBorder;
-    ctx.lineWidth = 2 / this.viewport.zoom;
-    ctx.strokeRect(activeX, activeY, activeW, activeH);
   }
 
   /* ------------------------------------------------------------------ */

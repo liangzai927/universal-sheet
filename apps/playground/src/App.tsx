@@ -1,5 +1,15 @@
 import type { CellPosition, CellRange, CellStyle, SheetData } from '@universal-sheet/core';
-import { createSheetData, getCellData, setCellValue, UndoRedoManager } from '@universal-sheet/core';
+import {
+  createSheetData,
+  getCellData,
+  getMergeAt,
+  getRowHeight,
+  mergeCells,
+  setCellValue,
+  setRowHeight,
+  UndoRedoManager,
+  unmergeCells,
+} from '@universal-sheet/core';
 import type { SheetRenderer } from '@universal-sheet/engine';
 import { useCallback, useEffect, useRef, useState } from 'react';
 
@@ -26,6 +36,33 @@ function cellRange(pos: CellPosition): CellRange {
   return { startRow: pos.row, startCol: pos.col, endRow: pos.row, endCol: pos.col };
 }
 
+/** Ensures the merged cell's total row height is enough to display all content. */
+function autoFitMergedRowHeight(sheet: SheetData, range: CellRange): SheetData {
+  const cell = getCellData(sheet, range.startRow, range.startCol);
+  const value = cell?.value != null ? String(cell.value) : '';
+  if (!value) return sheet;
+
+  const lines = value.split('\n').length;
+  const CELL_FONT_SIZE = 13;
+  const CELL_PADDING = 6;
+  const neededHeight = Math.max(
+    sheet.config.defaultRowHeight,
+    CELL_PADDING * 2 + lines * CELL_FONT_SIZE * 1.4,
+  );
+
+  let currentTotalHeight = 0;
+  for (let r = range.startRow; r <= range.endRow; r++) {
+    currentTotalHeight += getRowHeight(sheet, r);
+  }
+
+  if (neededHeight > currentTotalHeight) {
+    const delta = neededHeight - currentTotalHeight;
+    const lastRowHeight = getRowHeight(sheet, range.endRow);
+    return setRowHeight(sheet, range.endRow, lastRowHeight + delta);
+  }
+  return sheet;
+}
+
 export default function App() {
   const rendererRef = useRef<SheetRenderer | null>(null);
   const [zoom, setZoom] = useState(100);
@@ -47,6 +84,12 @@ export default function App() {
 
   const [activeTab, setActiveTab] = useState<string>('开始');
   const [currentStyle, setCurrentStyle] = useState<CellStyle | undefined>(undefined);
+
+  /* Merge dialog state */
+  const [mergeDialog, setMergeDialog] = useState<{
+    range: CellRange;
+    hasMultipleValues: boolean;
+  } | null>(null);
 
   /** Push current state + affected cell to undo stack before a mutation commits. */
   const pushUndo = (range: CellRange | null) => {
@@ -199,6 +242,105 @@ export default function App() {
     }
   }, []);
 
+  /* ---- Merge Cells ---- */
+
+  const isCurrentSelectionMerged = useCallback((): boolean => {
+    const renderer = rendererRef.current;
+    if (!renderer) return false;
+    const pos = renderer.getSelectedCell();
+    if (!pos) return false;
+    return getMergeAt(sheetDataRef.current, pos.row, pos.col) !== null;
+  }, []);
+
+  const canMergeSelection = useCallback((): boolean => {
+    const renderer = rendererRef.current;
+    if (!renderer) return false;
+    const pos = renderer.getSelectedCell();
+    if (!pos) return false;
+    const merge = getMergeAt(sheetDataRef.current, pos.row, pos.col);
+    if (merge) return true; /* can unmerge */
+    const rng = renderer.getCurrentSelectionRange?.() ?? null;
+    if (!rng) return false;
+    return rng.startRow !== rng.endRow || rng.startCol !== rng.endCol;
+  }, []);
+
+  const handleMerge = useCallback(() => {
+    const renderer = rendererRef.current;
+    if (!renderer) return;
+    const pos = renderer.getSelectedCell();
+    if (!pos) return;
+
+    const merge = getMergeAt(sheetDataRef.current, pos.row, pos.col);
+    if (merge) {
+      /* Unmerge */
+      pushUndo(merge);
+      const updated = unmergeCells(sheetDataRef.current, merge.startRow, merge.startCol);
+      sheetDataRef.current = updated;
+      setSheetData(updated);
+      renderer.updateSheet(updated);
+      return;
+    }
+
+    const rng = renderer.getCurrentSelectionRange?.() ?? null;
+    if (!rng) return;
+    if (rng.startRow === rng.endRow && rng.startCol === rng.endCol) return;
+
+    /* Check if cells besides top-left have content. */
+    let hasExtraContent = false;
+    for (let r = rng.startRow; r <= rng.endRow; r++) {
+      for (let c = rng.startCol; c <= rng.endCol; c++) {
+        if (r === rng.startRow && c === rng.startCol) continue;
+        const cell = getCellData(sheetDataRef.current, r, c);
+        if (cell?.value != null && String(cell.value).length > 0) {
+          hasExtraContent = true;
+          break;
+        }
+      }
+      if (hasExtraContent) break;
+    }
+
+    if (hasExtraContent) {
+      setMergeDialog({ range: rng, hasMultipleValues: true });
+    } else {
+      pushUndo(rng);
+      let updated = mergeCells(sheetDataRef.current, rng, false);
+      if (updated) {
+        updated = autoFitMergedRowHeight(updated, rng);
+        sheetDataRef.current = updated;
+        setSheetData(updated);
+        renderer.updateSheet(updated);
+        renderer.selectRange({
+          startRow: rng.startRow,
+          startCol: rng.startCol,
+          endRow: rng.endRow,
+          endCol: rng.endCol,
+        });
+      }
+    }
+  }, []);
+
+  const confirmMerge = useCallback((mergeContent: boolean) => {
+    if (!mergeDialog) return;
+    const renderer = rendererRef.current;
+    if (!renderer) return;
+    const rng = mergeDialog.range;
+    pushUndo(rng);
+    let updated = mergeCells(sheetDataRef.current, rng, mergeContent);
+    if (updated) {
+      updated = autoFitMergedRowHeight(updated, rng);
+      sheetDataRef.current = updated;
+      setSheetData(updated);
+      renderer.updateSheet(updated);
+      renderer.selectRange({
+        startRow: rng.startRow,
+        startCol: rng.startCol,
+        endRow: rng.endRow,
+        endCol: rng.endCol,
+      });
+    }
+    setMergeDialog(null);
+  }, [mergeDialog]);
+
   return (
     <div style={{ display: 'flex', flexDirection: 'column', height: '100vh' }}>
       {/* ---- Ribbon Toolbar ---- */}
@@ -216,7 +358,18 @@ export default function App() {
         onZoomOut={handleZoomOut}
         onZoomReset={handleZoomReset}
         rendererRef={rendererRef}
+        onMerge={handleMerge}
+        isMerged={isCurrentSelectionMerged()}
+        canMerge={canMergeSelection()}
       />
+
+      {/* ---- Merge Content Dialog ---- */}
+      {mergeDialog && (
+        <MergeContentDialog
+          onConfirm={confirmMerge}
+          onCancel={() => setMergeDialog(null)}
+        />
+      )}
 
       {/* ---- Formula Bar ---- */}
       <div
@@ -273,6 +426,8 @@ export default function App() {
           onSheetChange={handleSheetChange}
           onUndo={handleUndo}
           onRedo={handleRedo}
+          onMerge={handleMerge}
+          isMerged={isCurrentSelectionMerged()}
         />
       </div>
     </div>
@@ -297,6 +452,9 @@ interface RibbonProps {
   readonly onZoomOut: () => void;
   readonly onZoomReset: () => void;
   readonly rendererRef: React.RefObject<SheetRenderer | null>;
+  readonly onMerge: () => void;
+  readonly isMerged: boolean;
+  readonly canMerge: boolean;
 }
 
 const TABS = ['开始', '插入', '页面', '公式', '数据', '视图'] as const;
@@ -391,6 +549,9 @@ function Ribbon({
   onZoomOut,
   onZoomReset,
   rendererRef,
+  onMerge,
+  isMerged,
+  canMerge,
 }: RibbonProps) {
   const [panelVisible, setPanelVisible] = useState(false);
   const hideTimer = useRef<ReturnType<typeof setTimeout> | null>(null);
@@ -638,6 +799,23 @@ function Ribbon({
                 currentColor={currentStyle?.backgroundColor}
               />
             </div>
+
+            <div style={{ width: 1, height: 32, background: '#e8e8e8', alignSelf: 'center' }} />
+
+            {/* 合并单元格 */}
+            <div style={groupStyle}>
+              <span style={TOOL_LABEL_STYLE}>合并</span>
+              <ToolBtn
+                active={isMerged}
+                onClick={() => {
+                  onMerge();
+                }}
+                title={isMerged ? '取消合并' : '合并单元格'}
+                disabled={!canMerge}
+              >
+                {isMerged ? '拆分' : '合并'}
+              </ToolBtn>
+            </div>
           </>
         )}
       </div>
@@ -715,12 +893,14 @@ function ToolBtn({
   title,
   style,
   active,
+  disabled,
   children,
 }: {
   readonly onClick?: () => void;
   readonly title?: string;
   readonly style?: React.CSSProperties;
   readonly active?: boolean;
+  readonly disabled?: boolean;
   readonly children: React.ReactNode;
 }) {
   const bg = active ? '#e0e8f0' : '#fff';
@@ -729,6 +909,7 @@ function ToolBtn({
     <button
       onClick={onClick}
       title={title}
+      disabled={disabled}
       style={{
         width: 26,
         height: 26,
@@ -736,7 +917,8 @@ function ToolBtn({
         border: active ? '1px solid #1a73e8' : '1px solid #ddd',
         borderRadius: 3,
         background: bg,
-        cursor: 'pointer',
+        cursor: disabled ? 'default' : 'pointer',
+        opacity: disabled ? 0.35 : 1,
         display: 'flex',
         alignItems: 'center',
         justifyContent: 'center',
@@ -744,7 +926,7 @@ function ToolBtn({
         ...style,
       }}
       onMouseEnter={(e) => {
-        e.currentTarget.style.background = hoverBg;
+        if (!disabled) e.currentTarget.style.background = hoverBg;
       }}
       onMouseLeave={(e) => {
         e.currentTarget.style.background = bg;
@@ -987,6 +1169,102 @@ function ColorPicker({
           </button>
         </div>
       )}
+    </div>
+  );
+}
+
+/* ------------------------------------------------------------------ */
+/*  Merge Content Confirmation Dialog                                   */
+/* ------------------------------------------------------------------ */
+
+function MergeContentDialog({
+  onConfirm,
+  onCancel,
+}: {
+  readonly onConfirm: (mergeContent: boolean) => void;
+  readonly onCancel: () => void;
+}) {
+  return (
+    <div
+      style={{
+        position: 'fixed',
+        inset: 0,
+        background: 'rgba(0,0,0,0.35)',
+        display: 'flex',
+        alignItems: 'center',
+        justifyContent: 'center',
+        zIndex: 1000,
+      }}
+      onClick={onCancel}
+    >
+      <div
+        style={{
+          background: '#fff',
+          borderRadius: 8,
+          padding: '24px 28px',
+          width: 360,
+          boxShadow: '0 8px 32px rgba(0,0,0,0.2)',
+        }}
+        onClick={(e) => e.stopPropagation()}
+      >
+        <h3 style={{ margin: '0 0 12px', fontSize: 16, fontWeight: 600 }}>
+          合并单元格
+        </h3>
+        <p style={{ margin: '0 0 20px', fontSize: 13, color: '#555', lineHeight: 1.6 }}>
+          选区内多个单元格包含内容。请选择如何处理：
+        </p>
+        <div style={{ display: 'flex', flexDirection: 'column', gap: 10 }}>
+          <button
+            onClick={() => onConfirm(false)}
+            style={{
+              padding: '10px 14px',
+              fontSize: 13,
+              border: '1px solid #ddd',
+              borderRadius: 6,
+              background: '#f8f9fa',
+              cursor: 'pointer',
+              textAlign: 'left',
+            }}
+          >
+            <strong style={{ color: '#1a73e8' }}>仅保留左上角内容</strong>
+            <span style={{ display: 'block', fontSize: 12, color: '#888', marginTop: 4 }}>
+              其他单元格的内容将被删除
+            </span>
+          </button>
+          <button
+            onClick={() => onConfirm(true)}
+            style={{
+              padding: '10px 14px',
+              fontSize: 13,
+              border: '1px solid #ddd',
+              borderRadius: 6,
+              background: '#f8f9fa',
+              cursor: 'pointer',
+              textAlign: 'left',
+            }}
+          >
+            <strong style={{ color: '#1a73e8' }}>合并所有内容</strong>
+            <span style={{ display: 'block', fontSize: 12, color: '#888', marginTop: 4 }}>
+              按从左到右、从上到下的顺序换行拼接
+            </span>
+          </button>
+        </div>
+        <div style={{ display: 'flex', justifyContent: 'flex-end', marginTop: 16 }}>
+          <button
+            onClick={onCancel}
+            style={{
+              padding: '6px 16px',
+              fontSize: 13,
+              border: '1px solid #ddd',
+              borderRadius: 4,
+              background: '#fff',
+              cursor: 'pointer',
+            }}
+          >
+            取消
+          </button>
+        </div>
+      </div>
     </div>
   );
 }

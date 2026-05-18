@@ -13,13 +13,19 @@ export {
 export {
   createSheetConfig,
   createSheetData,
+  findOverlappingMerge,
   getCellData,
   getColumnWidth,
+  getMergeAt,
+  getMergeByAnchor,
   getRowHeight,
+  isMergeAnchor,
+  mergeCells,
   setCellStyle,
   setCellValue,
   setColumnWidth,
   setRowHeight,
+  unmergeCells,
 } from './sheet-model';
 export type {
   CellData,

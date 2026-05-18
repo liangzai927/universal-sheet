@@ -82,6 +82,11 @@ export interface SheetData {
   readonly cells: ReadonlyMap<string, CellData>;
   readonly columns: ReadonlyMap<number, ColumnData>;
   readonly rows: ReadonlyMap<number, RowData>;
+  /**
+   * Merged cell ranges keyed by their anchor cell (top-left corner).
+   * Key format: cellKey(startRow, startCol).
+   */
+  readonly merges: ReadonlyMap<string, CellRange>;
 }
 
 /** Default sheet configuration values. */

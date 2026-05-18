@@ -6,6 +6,8 @@ interface ContextMenuProps {
   readonly onCut?: () => void;
   readonly onCopy?: () => void;
   readonly onPaste?: () => void;
+  readonly onMerge?: () => void;
+  readonly isMerged?: boolean;
   readonly onClose: () => void;
 }
 
@@ -19,6 +21,8 @@ export const ContextMenu = memo(function ContextMenu({
   onCut,
   onCopy,
   onPaste,
+  onMerge,
+  isMerged,
   onClose,
 }: ContextMenuProps) {
   const menuRef = useRef<HTMLDivElement>(null);
@@ -100,6 +104,21 @@ export const ContextMenu = memo(function ContextMenu({
       >
         Paste
       </button>
+      {onMerge && (
+        <>
+          <div style={{ height: 1, background: '#e0e0e0', margin: '4px 0' }} />
+          <button
+            className="us-context-menu-item"
+            onClick={() => {
+              onMerge();
+              onClose();
+            }}
+            style={menuItemStyle}
+          >
+            {isMerged ? '取消合并' : '合并单元格'}
+          </button>
+        </>
+      )}
     </div>
   );
 });

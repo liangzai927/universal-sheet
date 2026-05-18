@@ -1,6 +1,5 @@
-import { getCellData, setCellStyle, setCellValue } from './sheet-model';
-import type { CellStyle } from './types';
-import type { CellRange, SheetData } from './types';
+import { getCellData, getMergeAt, setCellStyle, setCellValue } from './sheet-model';
+import type { CellRange, CellStyle, SheetData } from './types';
 import { cellKey } from './types';
 
 /* ------------------------------------------------------------------ */
@@ -60,16 +59,31 @@ export function pasteCellRangeText(
 
 /**
  * Clears all cells in the given range — removes values AND styles.
+ * Also removes any merges that intersect the cleared range.
  * Used for cut operations so cells return to their default state.
  */
 export function clearCellRange(sheet: SheetData, range: CellRange): SheetData {
-  const next = new Map(sheet.cells);
+  const nextCells = new Map(sheet.cells);
   for (let r = range.startRow; r <= range.endRow; r++) {
     for (let c = range.startCol; c <= range.endCol; c++) {
-      next.delete(cellKey(r, c));
+      nextCells.delete(cellKey(r, c));
     }
   }
-  return { ...sheet, cells: next };
+
+  /* Remove merges that intersect the cleared range. */
+  const nextMerges = new Map(sheet.merges);
+  for (const [key, rng] of nextMerges) {
+    const intersects =
+      rng.startCol <= range.endCol &&
+      rng.endCol >= range.startCol &&
+      rng.startRow <= range.endRow &&
+      rng.endRow >= range.startRow;
+    if (intersects) {
+      nextMerges.delete(key);
+    }
+  }
+
+  return { ...sheet, cells: nextCells, merges: nextMerges };
 }
 
 /* ------------------------------------------------------------------ */
@@ -93,6 +107,8 @@ interface ClipboardPayload {
   readonly rows: number;
   readonly cols: number;
   readonly cells: Array<SerializedCell>;
+  /** Merged ranges present in the copied selection. */
+  readonly merges?: Array<CellRange>;
 }
 
 const MIME_TYPE = 'application/x-universal-sheet-cells';
@@ -100,6 +116,7 @@ const MIME_TYPE = 'application/x-universal-sheet-cells';
 /**
  * Serializes all cell data (value, style, formula) from a range into
  * a JSON string suitable for structured clipboard transfer.
+ * Also preserves any merges whose anchor lies inside the range.
  */
 export function serializeCellRange(sheet: SheetData, range: CellRange): string {
   const cells: Array<SerializedCell> = [];
@@ -120,12 +137,31 @@ export function serializeCellRange(sheet: SheetData, range: CellRange): string {
     }
   }
 
+  /* Collect merges whose anchor is inside the copied range. */
+  const merges: Array<CellRange> = [];
+  for (const [, rng] of sheet.merges) {
+    if (
+      rng.startRow >= range.startRow &&
+      rng.startCol >= range.startCol &&
+      rng.endRow <= range.endRow &&
+      rng.endCol <= range.endCol
+    ) {
+      merges.push({
+        startRow: rng.startRow - range.startRow,
+        startCol: rng.startCol - range.startCol,
+        endRow: rng.endRow - range.startRow,
+        endCol: rng.endCol - range.startCol,
+      });
+    }
+  }
+
   const payload: ClipboardPayload = {
     type: 'universal-sheet-cells',
     version: 1,
     rows: range.endRow - range.startRow + 1,
     cols: range.endCol - range.startCol + 1,
     cells,
+    merges: merges.length > 0 ? merges : undefined,
   };
 
   return JSON.stringify(payload);
@@ -154,7 +190,7 @@ export function tryParseClipboardPayload(text: string): ClipboardPayload | null 
 
 /**
  * Pastes structured cell data from a clipboard payload into the sheet.
- * Preserves values, styles, formulas and display values.
+ * Preserves values, styles, formulas, display values and merges.
  */
 export function pasteCellRangeStructured(
   sheet: SheetData,
@@ -179,6 +215,31 @@ export function pasteCellRangeStructured(
     }
 
     /* TODO: apply formula when formula engine is ready. */
+  }
+
+  /* Re-create merges from the payload. */
+  if (payload.merges) {
+    const nextMerges = new Map(updated.merges);
+    for (const rng of payload.merges) {
+      const absRng: CellRange = {
+        startRow: startRow + rng.startRow,
+        startCol: startCol + rng.startCol,
+        endRow: startRow + rng.endRow,
+        endCol: startCol + rng.endCol,
+      };
+      /* Skip if out of bounds. */
+      if (
+        absRng.startRow >= rowCount ||
+        absRng.startCol >= colCount ||
+        absRng.endRow >= rowCount ||
+        absRng.endCol >= colCount
+      ) {
+        continue;
+      }
+      const key = cellKey(absRng.startRow, absRng.startCol);
+      nextMerges.set(key, absRng);
+    }
+    updated = { ...updated, merges: nextMerges };
   }
 
   return updated;
