@@ -1266,8 +1266,8 @@ export class SheetRenderer {
     ctx.scale(zoom, zoom);
     this.renderDataBg();
     this.renderGridLines();
-    this.renderSelectionFill();
     this.renderCells();
+    this.renderSelectionFill();
     this.renderSelectionBorder();
     this.renderMarchingAnts();
     ctx.restore();
@@ -1612,13 +1612,16 @@ export class SheetRenderer {
     const { ctx, theme } = this;
     const { row, col } = this.selectedCell;
 
+    ctx.save();
+    ctx.globalAlpha = 0.3;
+    ctx.fillStyle = theme.selectionBg;
+
     if (this.selectionType === 'column') {
       const rng = normalizeRange(this.selectionAnchor.row, this.selectionAnchor.col, row, col);
       const y0 = this.getRowY(0);
       const h = this.getTotalHeight() - this.sheet.config.headerRowHeight;
 
       /* Fill all columns in the range. */
-      ctx.fillStyle = theme.selectionBg;
       for (let c = rng.startCol; c <= rng.endCol; c++) {
         const cx = this.getColumnX(c);
         const cw = getColumnWidth(this.sheet, c);
@@ -1631,6 +1634,7 @@ export class SheetRenderer {
       ctx.strokeStyle = theme.selectionBorder;
       ctx.lineWidth = 2 / this.viewport.zoom;
       ctx.strokeRect(rangeX, y0, rangeW, h);
+      ctx.restore();
       return;
     }
 
@@ -1640,7 +1644,6 @@ export class SheetRenderer {
       const w = this.getTotalWidth() - this.sheet.config.headerColWidth;
 
       /* Fill all rows in the range. */
-      ctx.fillStyle = theme.selectionBg;
       for (let r = rng.startRow; r <= rng.endRow; r++) {
         const ry = this.getRowY(r);
         const rh = getRowHeight(this.sheet, r);
@@ -1653,6 +1656,7 @@ export class SheetRenderer {
       ctx.strokeStyle = theme.selectionBorder;
       ctx.lineWidth = 2 / this.viewport.zoom;
       ctx.strokeRect(x0, rangeY, w, rangeH);
+      ctx.restore();
       return;
     }
 
@@ -1664,18 +1668,10 @@ export class SheetRenderer {
     const rngW = this.getColumnX(rng.endCol) + getColumnWidth(this.sheet, rng.endCol) - rngX;
     const rngH = this.getRowY(rng.endRow) + getRowHeight(this.sheet, rng.endRow) - rngY;
 
-    /* Fill the range. */
-    ctx.fillStyle = theme.selectionBg;
+    /* Fill the range. Active cell is filled like the rest so its
+       background color remains visible (blended with the selection tint). */
     ctx.fillRect(rngX, rngY, rngW, rngH);
-
-    /* Draw the active cell in white. */
-    const activeX = this.getColumnX(col);
-    const activeY = this.getRowY(row);
-    const activeW = getColumnWidth(this.sheet, col);
-    const activeH = getRowHeight(this.sheet, row);
-
-    ctx.fillStyle = '#ffffff';
-    ctx.fillRect(activeX, activeY, activeW, activeH);
+    ctx.restore();
   }
 
   private renderSelectionBorder(): void {
