@@ -5,7 +5,6 @@ import {
   extractCellRangeText,
   getCellData,
   getColumnWidth,
-  getMergeAt,
   getMergeByAnchor,
   getRowHeight,
   pasteCellRangeStructured,
@@ -925,9 +924,7 @@ export class SheetRenderer {
             : this.selectedCell;
 
           const newMerge = this.getMergeAt(cellPos.row, cellPos.col);
-          const newPos = newMerge
-            ? createPosition(newMerge.startRow, newMerge.startCol)
-            : cellPos;
+          const newPos = newMerge ? createPosition(newMerge.startRow, newMerge.startCol) : cellPos;
 
           if (newPos.row !== curPos.row || newPos.col !== curPos.col) {
             this.selectedCell = cellPos;
@@ -1206,12 +1203,7 @@ export class SheetRenderer {
    */
   private getMergeAt(row: number, col: number): CellRange | null {
     for (const rng of this.sheet.merges.values()) {
-      if (
-        row >= rng.startRow &&
-        row <= rng.endRow &&
-        col >= rng.startCol &&
-        col <= rng.endCol
-      ) {
+      if (row >= rng.startRow && row <= rng.endRow && col >= rng.startCol && col <= rng.endCol) {
         return rng;
       }
     }
@@ -1588,12 +1580,9 @@ export class SheetRenderer {
 
   private renderGridLines(): void {
     const { ctx, theme } = this;
-    const { headerColWidth, headerRowHeight } = this.sheet.config;
 
     const visCols = this.getVisibleCols();
     const visRows = this.getVisibleRows();
-    const totalW = this.getTotalWidth();
-    const totalH = this.getTotalHeight();
 
     ctx.strokeStyle = theme.gridLine;
     ctx.lineWidth = 1 / this.viewport.zoom;

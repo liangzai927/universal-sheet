@@ -163,10 +163,7 @@ export function isMergeAnchor(sheet: SheetData, row: number, col: number): boole
  * Checks whether any existing merge overlaps (but is not fully contained by)
  * the given range. Returns the first overlapping merge found, or null.
  */
-export function findOverlappingMerge(
-  sheet: SheetData,
-  range: CellRange,
-): CellRange | null {
+export function findOverlappingMerge(sheet: SheetData, range: CellRange): CellRange | null {
   for (const rng of sheet.merges.values()) {
     const overlaps =
       rng.startCol <= range.endCol &&
@@ -215,8 +212,8 @@ export function mergeCells(
     return null;
   }
 
-  let nextCells = new Map(sheet.cells);
-  let nextMerges = new Map(sheet.merges);
+  const nextCells = new Map(sheet.cells);
+  const nextMerges = new Map(sheet.merges);
 
   /* Remove any existing merges fully contained in the new range. */
   for (const [key, rng] of nextMerges) {
@@ -244,7 +241,10 @@ export function mergeCells(
     }
     const mergedValue = parts.join('\n');
     const existing = nextCells.get(anchorKey);
-    nextCells.set(anchorKey, existing ? { ...existing, value: mergedValue } : { value: mergedValue });
+    nextCells.set(
+      anchorKey,
+      existing ? { ...existing, value: mergedValue } : { value: mergedValue },
+    );
   }
 
   /* Delete non-anchor cells inside the merge range. */

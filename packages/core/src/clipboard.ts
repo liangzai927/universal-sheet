@@ -1,4 +1,4 @@
-import { getCellData, getMergeAt, setCellStyle, setCellValue } from './sheet-model';
+import { getCellData, setCellStyle, setCellValue } from './sheet-model';
 import type { CellRange, CellStyle, SheetData } from './types';
 import { cellKey } from './types';
 
