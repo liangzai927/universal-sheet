@@ -42,6 +42,11 @@ interface FormulaReferenceEditRange {
   readonly end: number;
 }
 
+interface FormulaDisplaySegment {
+  readonly text: string;
+  readonly color?: string;
+}
+
 const FORMULA_FUNCTION_OPTIONS: ReadonlyArray<FormulaFunctionOption> = [
   { name: 'SUM', signature: '数值, ...', description: '求和' },
   { name: 'AVERAGE', signature: '数值, ...', description: '平均值' },
@@ -212,6 +217,42 @@ function getFormulaReferenceHighlights(formula: string): Array<FormulaReferenceH
   return highlights;
 }
 
+/**
+ * 将公式文本拆分为可着色展示片段。
+ *
+ * @param formula - 公式文本
+ * @returns 公式展示片段；单元格引用片段会带上对应颜色
+ * @author liangzai927
+ */
+function getFormulaDisplaySegments(formula: string): Array<FormulaDisplaySegment> {
+  if (!formula.startsWith('=')) return [{ text: formula }];
+
+  const segments: Array<FormulaDisplaySegment> = [];
+  const pattern = /\$?[A-Z]+\$?\d+(?::\$?[A-Z]+\$?\d+)?/gi;
+  let cursor = 0;
+  let colorIndex = 0;
+  let match: RegExpExecArray | null;
+
+  while ((match = pattern.exec(formula)) !== null) {
+    if (match.index > cursor) {
+      segments.push({ text: formula.slice(cursor, match.index) });
+    }
+
+    segments.push({
+      text: match[0],
+      color: FORMULA_REFERENCE_COLORS[colorIndex % FORMULA_REFERENCE_COLORS.length] ?? '#2563eb',
+    });
+    colorIndex += 1;
+    cursor = match.index + match[0].length;
+  }
+
+  if (cursor < formula.length) {
+    segments.push({ text: formula.slice(cursor) });
+  }
+
+  return segments.length > 0 ? segments : [{ text: formula }];
+}
+
 interface SheetViewProps {
   readonly data?: SheetData;
   readonly onSelectionChange?: (pos: CellPosition | null) => void;
@@ -311,6 +352,8 @@ export const SheetView = memo(function SheetView({
 
   const formulaFunctionPrefix = getFormulaFunctionPrefix(formulaEditorValue, formulaCursor);
   const formulaSuggestions = getFormulaFunctionSuggestions(formulaFunctionPrefix);
+  const formulaDisplaySegments = getFormulaDisplaySegments(formulaEditorValue);
+  const isFormulaEditorOverlayVisible = editState !== null && formulaEditorValue.startsWith('=');
   const activeFormulaFunction =
     formulaSuggestions.length === 0
       ? getActiveFormulaFunction(formulaEditorValue, formulaCursor)
@@ -818,7 +861,10 @@ export const SheetView = memo(function SheetView({
   const handleInputSelect = useCallback((e: React.SyntheticEvent<HTMLTextAreaElement>): void => {
     const input = e.currentTarget;
     const cursor = input.selectionStart;
-    if (canInsertFormulaReferenceAtCursor(input.value, cursor)) {
+    const replaceRange = formulaReferenceReplaceRangeRef.current;
+    if (replaceRange && cursor !== replaceRange.end) {
+      formulaReferenceReplaceRangeRef.current = null;
+    } else if (canInsertFormulaReferenceAtCursor(input.value, cursor)) {
       formulaReferenceReplaceRangeRef.current = null;
     }
     formulaCursorRef.current = cursor;
@@ -961,9 +1007,58 @@ export const SheetView = memo(function SheetView({
         onMouseDownCapture={() => {
           if (canPickFormulaReference()) {
             skipNextFormulaBlurRef.current = true;
+            return;
           }
+          commitEdit();
         }}
       />
+
+      {editState && isFormulaEditorOverlayVisible && (
+        <div
+          aria-hidden="true"
+          style={{
+            position: 'absolute',
+            left: editState.x,
+            top: editState.y,
+            width: editState.width,
+            height: editState.height,
+            padding: '2px 4px',
+            border: '2px solid transparent',
+            outline: 'none',
+            fontSize: editState.style?.fontSize ?? 13,
+            fontFamily:
+              editState.style?.fontFamily ??
+              '-apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif',
+            fontWeight: editState.style?.bold ? 'bold' : 'normal',
+            fontStyle: editState.style?.italic ? 'italic' : 'normal',
+            textDecoration:
+              [
+                editState.style?.underline ? 'underline' : '',
+                editState.style?.strikethrough ? 'line-through' : '',
+              ]
+                .filter(Boolean)
+                .join(' ') || 'none',
+            background: editState.style?.backgroundColor ?? '#fff',
+            textAlign: editState.style?.textAlign ?? 'left',
+            boxSizing: 'border-box',
+            zIndex: 10,
+            overflow: 'hidden',
+            lineHeight: 1.4,
+            whiteSpace: 'pre-wrap',
+            wordBreak: 'break-word',
+            pointerEvents: 'none',
+          }}
+        >
+          {formulaDisplaySegments.map((segment, index) => (
+            <span
+              key={`${String(index)}-${segment.text}`}
+              style={{ color: segment.color ?? editState.style?.color ?? '#1a1a1a' }}
+            >
+              {segment.text}
+            </span>
+          ))}
+        </div>
+      )}
 
       {editState && (
         <textarea
@@ -998,11 +1093,16 @@ export const SheetView = memo(function SheetView({
               ]
                 .filter(Boolean)
                 .join(' ') || 'none',
-            color: editState.style?.color ?? '#1a1a1a',
-            background: editState.style?.backgroundColor ?? '#fff',
+            color: isFormulaEditorOverlayVisible
+              ? 'transparent'
+              : (editState.style?.color ?? '#1a1a1a'),
+            caretColor: '#1a1a1a',
+            background: isFormulaEditorOverlayVisible
+              ? 'transparent'
+              : (editState.style?.backgroundColor ?? '#fff'),
             textAlign: editState.style?.textAlign ?? 'left',
             boxSizing: 'border-box',
-            zIndex: 10,
+            zIndex: 11,
             resize: 'none',
             overflow: 'hidden',
             lineHeight: 1.4,

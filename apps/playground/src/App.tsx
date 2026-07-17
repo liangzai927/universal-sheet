@@ -11,6 +11,7 @@ import {
   unmergeCells,
 } from '@universal-sheet/core';
 import type { SheetRenderer } from '@universal-sheet/engine';
+import type { SyntheticEvent } from 'react';
 import { useCallback, useEffect, useRef, useState } from 'react';
 
 import {
@@ -618,6 +619,23 @@ export default function App() {
   }, []);
 
   /**
+   * 处理公式栏光标变化，离开当前引用段后退出引用替换状态。
+   *
+   * @param e - 公式栏选择事件
+   * @author liangzai927
+   */
+  const handleFormulaSelect = useCallback((e: SyntheticEvent<HTMLInputElement>): void => {
+    const input = e.currentTarget;
+    const cursor = input.selectionStart ?? 0;
+    const replaceRange = formulaReferenceReplaceRangeRef.current;
+    if (replaceRange && cursor !== replaceRange.end) {
+      formulaReferenceReplaceRangeRef.current = null;
+    } else if (canInsertFormulaReferenceAtCursor(input.value, cursor)) {
+      formulaReferenceReplaceRangeRef.current = null;
+    }
+  }, []);
+
+  /**
    * 处理公式栏失焦提交。
    *
    * @author liangzai927
@@ -810,6 +828,7 @@ export default function App() {
             handleFormulaDraftChange(e.target.value);
           }}
           onFocus={handleFormulaFocus}
+          onSelect={handleFormulaSelect}
           onBlur={handleFormulaBlur}
           onKeyDown={(e) => {
             if (e.key === 'Enter') {
