@@ -1,11 +1,11 @@
 import type { CellPosition, CellRange, CellStyle, SheetData } from '@universal-sheet/core';
 import {
+  clearCellRange,
   createSheetData,
   getCellData,
   getMergeAt,
   getRowHeight,
   mergeCells,
-  setCellValue,
   setRowHeight,
   UndoRedoManager,
   unmergeCells,
@@ -13,6 +13,15 @@ import {
 import type { SheetRenderer } from '@universal-sheet/engine';
 import { useCallback, useEffect, useRef, useState } from 'react';
 
+import {
+  applyCellInput,
+  deleteColumnsWithFormulas,
+  deleteRowsWithFormulas,
+  getCellInputText,
+  insertColumnsWithFormulas,
+  insertRowsWithFormulas,
+  recalculateSheetFormulas,
+} from './formula-sheet';
 import { SheetView } from './SheetView';
 
 /** Excel-style column label from index (0 → A, 25 → Z, 26 → AA). */
@@ -34,6 +43,26 @@ function cellLabel(pos: CellPosition): string {
 /** Creates a single-cell CellRange from a CellPosition. */
 function cellRange(pos: CellPosition): CellRange {
   return { startRow: pos.row, startCol: pos.col, endRow: pos.row, endCol: pos.col };
+}
+
+interface FormulaReferenceEditRange {
+  readonly start: number;
+  readonly end: number;
+}
+
+/**
+ * 判断公式光标当前位置是否可以插入单元格引用。
+ *
+ * @param value - 当前公式文本
+ * @param cursor - 当前光标位置
+ * @returns 可以插入引用时返回 true
+ * @author liangzai927
+ */
+function canInsertFormulaReferenceAtCursor(value: string, cursor: number): boolean {
+  if (!value.startsWith('=')) return false;
+  const beforeCursor = value.slice(0, cursor).trimEnd();
+  if (beforeCursor === '=') return true;
+  return /(?:[+\-*/^&,=:(]|<=|>=|<>|<|>)$/.test(beforeCursor);
 }
 
 /** Ensures the merged cell's total row height is enough to display all content. */
@@ -65,10 +94,17 @@ function autoFitMergedRowHeight(sheet: SheetData, range: CellRange): SheetData {
 
 export default function App() {
   const rendererRef = useRef<SheetRenderer | null>(null);
+  const formulaInputRef = useRef<HTMLInputElement | null>(null);
+  const formulaEditTargetRef = useRef<CellPosition | null>(null);
+  const formulaReferenceReplaceRangeRef = useRef<FormulaReferenceEditRange | null>(null);
+  const formulaReferencePickingRef = useRef(false);
+  const formulaBarEditingRef = useRef(false);
+  const formulaDraftRef = useRef('');
   const [zoom, setZoom] = useState(100);
   const [selectedCell, setSelectedCell] = useState('-');
   const [selectedPos, setSelectedPos] = useState<CellPosition | null>(null);
   const [formulaValue, setFormulaValue] = useState('');
+  const [statusMessage, setStatusMessage] = useState('就绪');
   const [sheetData, setSheetData] = useState<SheetData>(createSheetData());
 
   /* Refs to keep latest values in closure-sensitive callbacks. */
@@ -76,7 +112,6 @@ export default function App() {
   selectedPosRef.current = selectedPos;
   const sheetDataRef = useRef(sheetData);
   sheetDataRef.current = sheetData;
-  const formulaProgramRef = useRef(false);
 
   const undoManagerRef = useRef(new UndoRedoManager());
   const [canUndo, setCanUndo] = useState(false);
@@ -98,6 +133,76 @@ export default function App() {
     setCanRedo(undoManagerRef.current.canRedo);
   };
 
+  /**
+   * 显示短暂操作状态。
+   *
+   * @param message - 操作反馈文案
+   * @author liangzai927
+   */
+  const showStatus = useCallback((message: string): void => {
+    setStatusMessage(message);
+  }, []);
+
+  useEffect(() => {
+    if (statusMessage === '就绪') return;
+    const timer = window.setTimeout(() => {
+      setStatusMessage('就绪');
+    }, 1800);
+    return () => {
+      window.clearTimeout(timer);
+    };
+  }, [statusMessage]);
+
+  /**
+   * 提交工作表变更并同步渲染器。
+   *
+   * @param updated - 更新后的工作表数据
+   * @param range - 本次变更影响范围
+   * @param message - 状态栏反馈文案
+   * @author liangzai927
+   */
+  const commitSheetMutation = useCallback(
+    (updated: SheetData, range: CellRange | null, message: string): void => {
+      pushUndo(range);
+      sheetDataRef.current = updated;
+      setSheetData(updated);
+      rendererRef.current?.updateSheet(updated);
+      showStatus(message);
+    },
+    [showStatus],
+  );
+
+  /**
+   * 获取当前选区，未框选时退回当前单元格。
+   *
+   * @returns 当前选区范围；无选中单元格时返回 null
+   * @author liangzai927
+   */
+  const getActiveRange = useCallback((): CellRange | null => {
+    const renderer = rendererRef.current;
+    const range = renderer?.getCurrentSelectionRange();
+    if (range) return range;
+
+    const pos = selectedPosRef.current;
+    return pos ? cellRange(pos) : null;
+  }, []);
+
+  /**
+   * 判断当前是否处于公式引用点选状态。
+   *
+   * @returns 可以点选单元格引用时返回 true
+   * @author liangzai927
+   */
+  const canPickFormulaReference = useCallback((): boolean => {
+    const cursor = formulaInputRef.current?.selectionStart ?? formulaDraftRef.current.length;
+    return (
+      formulaBarEditingRef.current &&
+      formulaEditTargetRef.current !== null &&
+      (formulaReferenceReplaceRangeRef.current !== null ||
+        canInsertFormulaReferenceAtCursor(formulaDraftRef.current, cursor))
+    );
+  }, []);
+
   /* ---- Renderer callbacks ---- */
 
   const handleReady = useCallback((renderer: SheetRenderer) => {
@@ -105,40 +210,222 @@ export default function App() {
     setZoom(renderer.getZoomPercent());
   }, []);
 
-  const handleSelectionChange = useCallback((pos: CellPosition | null) => {
-    if (pos) {
-      setSelectedCell(cellLabel(pos));
-      setSelectedPos(pos);
-      const cell = getCellData(sheetDataRef.current, pos.row, pos.col);
-      formulaProgramRef.current = true;
-      setFormulaValue(cell?.value != null ? String(cell.value) : '');
-      setCurrentStyle(cell?.style);
-    } else {
-      setSelectedCell('-');
-      setSelectedPos(null);
-      formulaProgramRef.current = true;
-      setFormulaValue('');
-      setCurrentStyle(undefined);
-    }
-  }, []);
+  const handleSelectionChange = useCallback(
+    (pos: CellPosition | null) => {
+      if (pos) {
+        if (canPickFormulaReference()) {
+          const target = formulaEditTargetRef.current;
+          if (!target) return;
+
+          insertFormulaReference(cellLabel(pos));
+          formulaReferencePickingRef.current = false;
+          setSelectedCell(cellLabel(target));
+          return;
+        }
+
+        setSelectedCell(cellLabel(pos));
+        setSelectedPos(pos);
+        const cell = getCellData(sheetDataRef.current, pos.row, pos.col);
+        const nextFormulaValue = getCellInputText(cell);
+        formulaDraftRef.current = nextFormulaValue;
+        setFormulaValue(nextFormulaValue);
+        setCurrentStyle(cell?.style);
+      } else {
+        setSelectedCell('-');
+        setSelectedPos(null);
+        formulaDraftRef.current = '';
+        setFormulaValue('');
+        setCurrentStyle(undefined);
+      }
+    },
+    [canPickFormulaReference],
+  );
 
   const handleCellChange = useCallback((_updated: SheetData, pos: CellPosition, _value: string) => {
     pushUndo(cellRange(pos));
-    sheetDataRef.current = _updated;
-    setSheetData(_updated);
+    const updated = applyCellInput(sheetDataRef.current, pos.row, pos.col, _value);
+    sheetDataRef.current = updated;
+    setSheetData(updated);
+    rendererRef.current?.updateSheet(updated);
     if (selectedPosRef.current?.row === pos.row && selectedPosRef.current.col === pos.col) {
-      const cell = getCellData(_updated, pos.row, pos.col);
-      formulaProgramRef.current = true;
-      setFormulaValue(cell?.value != null ? String(cell.value) : '');
+      const cell = getCellData(updated, pos.row, pos.col);
+      const nextFormulaValue = getCellInputText(cell);
+      formulaDraftRef.current = nextFormulaValue;
+      setFormulaValue(nextFormulaValue);
     }
   }, []);
 
-  const handleSheetChange = useCallback((sheet: SheetData) => {
-    const pos = selectedPosRef.current;
-    pushUndo(pos ? cellRange(pos) : null);
-    sheetDataRef.current = sheet;
-    setSheetData(sheet);
-  }, []);
+  const handleSheetChange = useCallback(
+    (sheet: SheetData) => {
+      const pos = selectedPosRef.current;
+      pushUndo(pos ? cellRange(pos) : null);
+      sheetDataRef.current = sheet;
+      setSheetData(sheet);
+      showStatus('工作表已更新');
+    },
+    [showStatus],
+  );
+
+  /**
+   * 在当前选区上方插入行。
+   *
+   * @author liangzai927
+   */
+  const handleInsertRowsAbove = useCallback((): void => {
+    const range = getActiveRange();
+    const renderer = rendererRef.current;
+    if (!range || !renderer) return;
+
+    const count = range.endRow - range.startRow + 1;
+    const updated = insertRowsWithFormulas(sheetDataRef.current, range.startRow, count);
+    const nextRange = {
+      startRow: range.startRow,
+      startCol: 0,
+      endRow: range.startRow + count - 1,
+      endCol: updated.config.colCount - 1,
+    };
+    commitSheetMutation(updated, nextRange, `已插入 ${count} 行`);
+    renderer.selectRange(nextRange, 'start');
+  }, [commitSheetMutation, getActiveRange]);
+
+  /**
+   * 在当前选区下方插入行。
+   *
+   * @author liangzai927
+   */
+  const handleInsertRowsBelow = useCallback((): void => {
+    const range = getActiveRange();
+    const renderer = rendererRef.current;
+    if (!range || !renderer) return;
+
+    const count = range.endRow - range.startRow + 1;
+    const insertIndex = range.endRow + 1;
+    const updated = insertRowsWithFormulas(sheetDataRef.current, insertIndex, count);
+    const nextRange = {
+      startRow: insertIndex,
+      startCol: 0,
+      endRow: insertIndex + count - 1,
+      endCol: updated.config.colCount - 1,
+    };
+    commitSheetMutation(updated, nextRange, `已在下方插入 ${count} 行`);
+    renderer.selectRange(nextRange, 'start');
+  }, [commitSheetMutation, getActiveRange]);
+
+  /**
+   * 删除当前选区所在行。
+   *
+   * @author liangzai927
+   */
+  const handleDeleteRows = useCallback((): void => {
+    const range = getActiveRange();
+    const renderer = rendererRef.current;
+    if (!range || !renderer) return;
+
+    const count = range.endRow - range.startRow + 1;
+    if (count >= sheetDataRef.current.config.rowCount) {
+      showStatus('至少保留一行');
+      return;
+    }
+
+    const updated = deleteRowsWithFormulas(sheetDataRef.current, range.startRow, count);
+    const nextRow = Math.min(range.startRow, Math.max(updated.config.rowCount - 1, 0));
+    const nextRange = {
+      startRow: nextRow,
+      startCol: 0,
+      endRow: nextRow,
+      endCol: Math.max(updated.config.colCount - 1, 0),
+    };
+    commitSheetMutation(updated, range, `已删除 ${count} 行`);
+    renderer.selectRange(nextRange, 'start');
+  }, [commitSheetMutation, getActiveRange]);
+
+  /**
+   * 在当前选区左侧插入列。
+   *
+   * @author liangzai927
+   */
+  const handleInsertColumnsLeft = useCallback((): void => {
+    const range = getActiveRange();
+    const renderer = rendererRef.current;
+    if (!range || !renderer) return;
+
+    const count = range.endCol - range.startCol + 1;
+    const updated = insertColumnsWithFormulas(sheetDataRef.current, range.startCol, count);
+    const nextRange = {
+      startRow: 0,
+      startCol: range.startCol,
+      endRow: updated.config.rowCount - 1,
+      endCol: range.startCol + count - 1,
+    };
+    commitSheetMutation(updated, nextRange, `已插入 ${count} 列`);
+    renderer.selectRange(nextRange, 'start');
+  }, [commitSheetMutation, getActiveRange]);
+
+  /**
+   * 在当前选区右侧插入列。
+   *
+   * @author liangzai927
+   */
+  const handleInsertColumnsRight = useCallback((): void => {
+    const range = getActiveRange();
+    const renderer = rendererRef.current;
+    if (!range || !renderer) return;
+
+    const count = range.endCol - range.startCol + 1;
+    const insertIndex = range.endCol + 1;
+    const updated = insertColumnsWithFormulas(sheetDataRef.current, insertIndex, count);
+    const nextRange = {
+      startRow: 0,
+      startCol: insertIndex,
+      endRow: updated.config.rowCount - 1,
+      endCol: insertIndex + count - 1,
+    };
+    commitSheetMutation(updated, nextRange, `已在右侧插入 ${count} 列`);
+    renderer.selectRange(nextRange, 'start');
+  }, [commitSheetMutation, getActiveRange]);
+
+  /**
+   * 删除当前选区所在列。
+   *
+   * @author liangzai927
+   */
+  const handleDeleteColumns = useCallback((): void => {
+    const range = getActiveRange();
+    const renderer = rendererRef.current;
+    if (!range || !renderer) return;
+
+    const count = range.endCol - range.startCol + 1;
+    if (count >= sheetDataRef.current.config.colCount) {
+      showStatus('至少保留一列');
+      return;
+    }
+
+    const updated = deleteColumnsWithFormulas(sheetDataRef.current, range.startCol, count);
+    const nextCol = Math.min(range.startCol, Math.max(updated.config.colCount - 1, 0));
+    const nextRange = {
+      startRow: 0,
+      startCol: nextCol,
+      endRow: Math.max(updated.config.rowCount - 1, 0),
+      endCol: nextCol,
+    };
+    commitSheetMutation(updated, range, `已删除 ${count} 列`);
+    renderer.selectRange(nextRange, 'start');
+  }, [commitSheetMutation, getActiveRange, showStatus]);
+
+  /**
+   * 清空当前选区内容并重算公式。
+   *
+   * @author liangzai927
+   */
+  const handleClearSelection = useCallback((): void => {
+    const range = getActiveRange();
+    const renderer = rendererRef.current;
+    if (!range || !renderer) return;
+
+    const updated = recalculateSheetFormulas(clearCellRange(sheetDataRef.current, range));
+    commitSheetMutation(updated, range, '已清空选区');
+    renderer.selectRange(range, 'start');
+  }, [commitSheetMutation, getActiveRange]);
 
   /* ---- Zoom controls ---- */
 
@@ -228,19 +515,118 @@ export default function App() {
 
   /* ---- Formula bar edit ---- */
 
-  const handleFormulaChange = useCallback((value: string) => {
-    setFormulaValue(value);
-    if (formulaProgramRef.current) {
-      formulaProgramRef.current = false;
+  /**
+   * 将单元格引用插入公式栏当前光标位置。
+   *
+   * @param ref - A1 单元格引用
+   * @author liangzai927
+   */
+  function insertFormulaReference(ref: string): void {
+    const input = formulaInputRef.current;
+    const current = input?.value ?? formulaValue;
+    const replaceRange = formulaReferenceReplaceRangeRef.current;
+    const start = replaceRange?.start ?? input?.selectionStart ?? current.length;
+    const end = replaceRange?.end ?? input?.selectionEnd ?? start;
+    const next = `${current.slice(0, start)}${ref}${current.slice(end)}`;
+    const cursor = start + ref.length;
+
+    formulaDraftRef.current = next;
+    formulaReferenceReplaceRangeRef.current = { start, end: cursor };
+    setFormulaValue(next);
+    queueMicrotask(() => {
+      input?.focus();
+      input?.setSelectionRange(cursor, cursor);
+    });
+  }
+
+  /**
+   * 提交公式栏草稿内容到当前单元格。
+   *
+   * @author liangzai927
+   */
+  const commitFormulaValue = useCallback((): void => {
+    const pos = formulaEditTargetRef.current ?? selectedPosRef.current;
+    const renderer = rendererRef.current;
+    if (!pos || !renderer) return;
+
+    const currentCell = getCellData(sheetDataRef.current, pos.row, pos.col);
+    if (formulaValue === getCellInputText(currentCell)) return;
+
+    pushUndo(cellRange(pos));
+    const updated = applyCellInput(sheetDataRef.current, pos.row, pos.col, formulaValue);
+    sheetDataRef.current = updated;
+    setSheetData(updated);
+    renderer.updateSheet(updated);
+
+    const nextCell = getCellData(updated, pos.row, pos.col);
+    const nextFormulaValue = getCellInputText(nextCell);
+    formulaDraftRef.current = nextFormulaValue;
+    setFormulaValue(nextFormulaValue);
+    formulaEditTargetRef.current = null;
+    formulaReferenceReplaceRangeRef.current = null;
+    formulaBarEditingRef.current = false;
+    renderer.selectCell(pos);
+  }, [formulaValue]);
+
+  /**
+   * 还原公式栏草稿为当前单元格内容。
+   *
+   * @author liangzai927
+   */
+  const resetFormulaValue = useCallback((): void => {
+    const pos = formulaEditTargetRef.current ?? selectedPosRef.current;
+    if (!pos) {
+      setFormulaValue('');
+      formulaReferenceReplaceRangeRef.current = null;
       return;
     }
-    const pos = selectedPosRef.current;
-    if (pos && rendererRef.current) {
-      const updated = setCellValue(sheetDataRef.current, pos.row, pos.col, value);
-      setSheetData(updated);
-      rendererRef.current.updateSheet(updated);
+
+    const nextFormulaValue = getCellInputText(getCellData(sheetDataRef.current, pos.row, pos.col));
+    formulaDraftRef.current = nextFormulaValue;
+    setFormulaValue(nextFormulaValue);
+    formulaEditTargetRef.current = null;
+    formulaReferenceReplaceRangeRef.current = null;
+    formulaBarEditingRef.current = false;
+    rendererRef.current?.selectCell(pos);
+  }, []);
+
+  /**
+   * 进入公式栏编辑状态。
+   *
+   * @author liangzai927
+   */
+  const handleFormulaFocus = useCallback((): void => {
+    formulaBarEditingRef.current = true;
+    formulaEditTargetRef.current = selectedPosRef.current;
+    formulaDraftRef.current = formulaValue;
+    formulaReferenceReplaceRangeRef.current = null;
+  }, [formulaValue]);
+
+  /**
+   * 更新公式栏草稿内容。
+   *
+   * @param value - 公式栏草稿文本
+   * @author liangzai927
+   */
+  const handleFormulaDraftChange = useCallback((value: string): void => {
+    formulaDraftRef.current = value;
+    formulaReferenceReplaceRangeRef.current = null;
+    setFormulaValue(value);
+    if (value.startsWith('=') && !formulaEditTargetRef.current) {
+      formulaEditTargetRef.current = selectedPosRef.current;
     }
   }, []);
+
+  /**
+   * 处理公式栏失焦提交。
+   *
+   * @author liangzai927
+   */
+  const handleFormulaBlur = useCallback((): void => {
+    if (formulaReferencePickingRef.current) return;
+    formulaBarEditingRef.current = false;
+    commitFormulaValue();
+  }, [commitFormulaValue]);
 
   /* ---- Merge Cells ---- */
 
@@ -259,7 +645,7 @@ export default function App() {
     if (!pos) return false;
     const merge = getMergeAt(sheetDataRef.current, pos.row, pos.col);
     if (merge) return true; /* can unmerge */
-    const rng = renderer.getCurrentSelectionRange?.() ?? null;
+    const rng = renderer.getCurrentSelectionRange();
     if (!rng) return false;
     return rng.startRow !== rng.endRow || rng.startCol !== rng.endCol;
   }, []);
@@ -281,7 +667,7 @@ export default function App() {
       return;
     }
 
-    const rng = renderer.getCurrentSelectionRange?.() ?? null;
+    const rng = renderer.getCurrentSelectionRange();
     if (!rng) return;
     if (rng.startRow === rng.endRow && rng.startCol === rng.endCol) return;
 
@@ -319,30 +705,35 @@ export default function App() {
     }
   }, []);
 
-  const confirmMerge = useCallback((mergeContent: boolean) => {
-    if (!mergeDialog) return;
-    const renderer = rendererRef.current;
-    if (!renderer) return;
-    const rng = mergeDialog.range;
-    pushUndo(rng);
-    let updated = mergeCells(sheetDataRef.current, rng, mergeContent);
-    if (updated) {
-      updated = autoFitMergedRowHeight(updated, rng);
-      sheetDataRef.current = updated;
-      setSheetData(updated);
-      renderer.updateSheet(updated);
-      renderer.selectRange({
-        startRow: rng.startRow,
-        startCol: rng.startCol,
-        endRow: rng.endRow,
-        endCol: rng.endCol,
-      });
-    }
-    setMergeDialog(null);
-  }, [mergeDialog]);
+  const confirmMerge = useCallback(
+    (mergeContent: boolean) => {
+      if (!mergeDialog) return;
+      const renderer = rendererRef.current;
+      if (!renderer) return;
+      const rng = mergeDialog.range;
+      pushUndo(rng);
+      let updated = mergeCells(sheetDataRef.current, rng, mergeContent);
+      if (updated) {
+        updated = autoFitMergedRowHeight(updated, rng);
+        sheetDataRef.current = updated;
+        setSheetData(updated);
+        renderer.updateSheet(updated);
+        renderer.selectRange({
+          startRow: rng.startRow,
+          startCol: rng.startCol,
+          endRow: rng.endRow,
+          endCol: rng.endCol,
+        });
+      }
+      setMergeDialog(null);
+    },
+    [mergeDialog],
+  );
+
+  const isFormulaDraft = formulaValue.startsWith('=');
 
   return (
-    <div style={{ display: 'flex', flexDirection: 'column', height: '100vh' }}>
+    <div style={APP_SHELL_STYLE}>
       {/* ---- Ribbon Toolbar ---- */}
       <Ribbon
         activeTab={activeTab}
@@ -361,28 +752,27 @@ export default function App() {
         onMerge={handleMerge}
         isMerged={isCurrentSelectionMerged()}
         canMerge={canMergeSelection()}
+        onInsertRowsAbove={handleInsertRowsAbove}
+        onInsertRowsBelow={handleInsertRowsBelow}
+        onDeleteRows={handleDeleteRows}
+        onInsertColumnsLeft={handleInsertColumnsLeft}
+        onInsertColumnsRight={handleInsertColumnsRight}
+        onDeleteColumns={handleDeleteColumns}
+        onClearSelection={handleClearSelection}
       />
 
       {/* ---- Merge Content Dialog ---- */}
       {mergeDialog && (
         <MergeContentDialog
           onConfirm={confirmMerge}
-          onCancel={() => setMergeDialog(null)}
+          onCancel={() => {
+            setMergeDialog(null);
+          }}
         />
       )}
 
       {/* ---- Formula Bar ---- */}
-      <div
-        style={{
-          display: 'flex',
-          alignItems: 'center',
-          gap: 6,
-          padding: '4px 16px',
-          borderBottom: '1px solid #d4d4d4',
-          background: '#fff',
-          flexShrink: 0,
-        }}
-      >
+      <div style={FORMULA_BAR_STYLE}>
         {/* Cell reference */}
         <span
           style={{
@@ -397,27 +787,65 @@ export default function App() {
         >
           {selectedCell}
         </span>
+        <span
+          style={{
+            minWidth: 26,
+            textAlign: 'center',
+            fontSize: 13,
+            fontWeight: 700,
+            color: isFormulaDraft ? '#1a73e8' : '#777',
+            borderRadius: 4,
+            background: isFormulaDraft ? '#e8f0fe' : '#f5f5f5',
+            padding: '3px 6px',
+          }}
+          title={isFormulaDraft ? '公式编辑模式' : '函数'}
+        >
+          fx
+        </span>
         {/* Content input */}
         <input
+          ref={formulaInputRef}
           value={formulaValue}
           onChange={(e) => {
-            handleFormulaChange(e.target.value);
+            handleFormulaDraftChange(e.target.value);
           }}
-          placeholder="Enter a value or formula"
+          onFocus={handleFormulaFocus}
+          onBlur={handleFormulaBlur}
+          onKeyDown={(e) => {
+            if (e.key === 'Enter') {
+              e.preventDefault();
+              commitFormulaValue();
+              e.currentTarget.blur();
+            } else if (e.key === 'Escape') {
+              e.preventDefault();
+              resetFormulaValue();
+              e.currentTarget.blur();
+            }
+          }}
+          placeholder="输入内容，或以 = 开始输入公式"
           style={{
             flex: 1,
             height: 26,
             border: 'none',
+            borderBottom: isFormulaDraft ? '1px solid #1a73e8' : '1px solid transparent',
             outline: 'none',
             fontSize: 13,
             fontFamily: '-apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif',
             background: 'transparent',
+            color: '#1f2937',
           }}
         />
       </div>
 
       {/* ---- Sheet Canvas ---- */}
-      <div style={{ flex: 1, overflow: 'hidden', position: 'relative' }}>
+      <div
+        style={{ flex: 1, overflow: 'hidden', position: 'relative' }}
+        onMouseDownCapture={() => {
+          if (canPickFormulaReference()) {
+            formulaReferencePickingRef.current = true;
+          }
+        }}
+      >
         <SheetView
           data={sheetData}
           onReady={handleReady}
@@ -428,7 +856,22 @@ export default function App() {
           onRedo={handleRedo}
           onMerge={handleMerge}
           isMerged={isCurrentSelectionMerged()}
+          onInsertRowsAbove={handleInsertRowsAbove}
+          onInsertRowsBelow={handleInsertRowsBelow}
+          onDeleteRows={handleDeleteRows}
+          onInsertColumnsLeft={handleInsertColumnsLeft}
+          onInsertColumnsRight={handleInsertColumnsRight}
+          onDeleteColumns={handleDeleteColumns}
+          onClearSelection={handleClearSelection}
+          onClipboardFeedback={showStatus}
         />
+      </div>
+
+      <div style={STATUS_BAR_STYLE}>
+        <span>{statusMessage}</span>
+        <span>
+          Node 24 · Formula ready · {sheetData.config.rowCount}R × {sheetData.config.colCount}C
+        </span>
       </div>
     </div>
   );
@@ -455,6 +898,13 @@ interface RibbonProps {
   readonly onMerge: () => void;
   readonly isMerged: boolean;
   readonly canMerge: boolean;
+  readonly onInsertRowsAbove: () => void;
+  readonly onInsertRowsBelow: () => void;
+  readonly onDeleteRows: () => void;
+  readonly onInsertColumnsLeft: () => void;
+  readonly onInsertColumnsRight: () => void;
+  readonly onDeleteColumns: () => void;
+  readonly onClearSelection: () => void;
 }
 
 const TABS = ['开始', '插入', '页面', '公式', '数据', '视图'] as const;
@@ -493,13 +943,45 @@ const BG_COLORS = [
   '#f5f5f5',
 ];
 
+const APP_SHELL_STYLE: React.CSSProperties = {
+  display: 'flex',
+  flexDirection: 'column',
+  height: '100vh',
+  background: 'linear-gradient(180deg, #f7f9fc 0%, #eef2f7 100%)',
+};
+
+const FORMULA_BAR_STYLE: React.CSSProperties = {
+  display: 'flex',
+  alignItems: 'center',
+  gap: 8,
+  padding: '8px 16px',
+  borderBottom: '1px solid #dbe2ea',
+  background: 'rgba(255,255,255,0.92)',
+  flexShrink: 0,
+  boxShadow: '0 1px 0 rgba(255,255,255,0.75) inset',
+};
+
+const STATUS_BAR_STYLE: React.CSSProperties = {
+  display: 'flex',
+  alignItems: 'center',
+  justifyContent: 'space-between',
+  height: 28,
+  padding: '0 14px',
+  borderTop: '1px solid #dbe2ea',
+  background: '#f8fafc',
+  color: '#667085',
+  fontSize: 12,
+  flexShrink: 0,
+};
+
 const RIBBON_TAB_STYLE: React.CSSProperties = {
-  padding: '5px 14px',
+  padding: '6px 14px',
   fontSize: 13,
   border: 'none',
+  borderRadius: 8,
   background: 'transparent',
   cursor: 'pointer',
-  color: '#444',
+  color: '#475467',
   transition: 'color 0.15s, background 0.15s',
 };
 
@@ -512,10 +994,10 @@ const FLOATING_PANEL_STYLE: React.CSSProperties = {
   display: 'flex',
   alignItems: 'center',
   gap: 6,
-  padding: '6px 16px',
-  background: '#fff',
-  borderBottom: '1px solid #e0e0e0',
-  boxShadow: '0 4px 12px rgba(0,0,0,0.08)',
+  padding: '8px 16px',
+  background: 'rgba(255,255,255,0.96)',
+  borderBottom: '1px solid #dbe2ea',
+  boxShadow: '0 12px 28px rgba(15,23,42,0.08)',
   opacity: 0,
   visibility: 'hidden',
   transition: 'opacity 0.15s ease, visibility 0.15s ease',
@@ -523,7 +1005,7 @@ const FLOATING_PANEL_STYLE: React.CSSProperties = {
 
 const TOOL_LABEL_STYLE: React.CSSProperties = {
   fontSize: 10,
-  color: '#888',
+  color: '#667085',
   marginBottom: 2,
   lineHeight: 1,
 };
@@ -552,6 +1034,13 @@ function Ribbon({
   onMerge,
   isMerged,
   canMerge,
+  onInsertRowsAbove,
+  onInsertRowsBelow,
+  onDeleteRows,
+  onInsertColumnsLeft,
+  onInsertColumnsRight,
+  onDeleteColumns,
+  onClearSelection,
 }: RibbonProps) {
   const [panelVisible, setPanelVisible] = useState(false);
   const hideTimer = useRef<ReturnType<typeof setTimeout> | null>(null);
@@ -586,14 +1075,15 @@ function Ribbon({
         style={{
           display: 'flex',
           alignItems: 'center',
-          background: '#f5f5f5',
-          borderBottom: '1px solid #e0e0e0',
-          paddingRight: 8,
-          height: 34,
+          background: 'rgba(255,255,255,0.94)',
+          borderBottom: '1px solid #dbe2ea',
+          padding: '0 10px 0 0',
+          height: 42,
+          boxShadow: '0 1px 0 rgba(255,255,255,0.85) inset',
         }}
       >
-        <span style={{ fontWeight: 700, fontSize: 14, padding: '0 16px', color: '#1a73e8' }}>
-          Sheet
+        <span style={{ fontWeight: 700, fontSize: 14, padding: '0 16px', color: '#1f3a5f' }}>
+          Universal Sheet
         </span>
         {TABS.map((tab) => (
           <button
@@ -606,9 +1096,8 @@ function Ribbon({
             }}
             style={{
               ...RIBBON_TAB_STYLE,
-              borderBottom: activeTab === tab ? '2px solid #1a73e8' : '2px solid transparent',
-              background: activeTab === tab ? '#fff' : 'transparent',
-              color: activeTab === tab ? '#1a73e8' : '#555',
+              background: activeTab === tab ? '#e8f1ff' : 'transparent',
+              color: activeTab === tab ? '#175cd3' : '#475467',
               fontWeight: activeTab === tab ? 600 : 400,
             }}
           >
@@ -816,6 +1305,51 @@ function Ribbon({
                 {isMerged ? '拆分' : '合并'}
               </ToolBtn>
             </div>
+
+            <div style={{ width: 1, height: 32, background: '#e8e8e8', alignSelf: 'center' }} />
+
+            <div style={groupStyle}>
+              <span style={TOOL_LABEL_STYLE}>编辑</span>
+              <ActionBtn onClick={onClearSelection} title="清空选区内容">
+                清空
+              </ActionBtn>
+            </div>
+          </>
+        )}
+
+        {activeTab === '插入' && (
+          <>
+            <div style={groupStyle}>
+              <span style={TOOL_LABEL_STYLE}>行</span>
+              <div style={{ display: 'flex', gap: 4 }}>
+                <ActionBtn onClick={onInsertRowsAbove} title="在选区上方插入同等数量的行">
+                  上方
+                </ActionBtn>
+                <ActionBtn onClick={onInsertRowsBelow} title="在选区下方插入同等数量的行">
+                  下方
+                </ActionBtn>
+                <ActionBtn danger onClick={onDeleteRows} title="删除选区所在行">
+                  删除行
+                </ActionBtn>
+              </div>
+            </div>
+
+            <div style={{ width: 1, height: 32, background: '#e8e8e8', alignSelf: 'center' }} />
+
+            <div style={groupStyle}>
+              <span style={TOOL_LABEL_STYLE}>列</span>
+              <div style={{ display: 'flex', gap: 4 }}>
+                <ActionBtn onClick={onInsertColumnsLeft} title="在选区左侧插入同等数量的列">
+                  左侧
+                </ActionBtn>
+                <ActionBtn onClick={onInsertColumnsRight} title="在选区右侧插入同等数量的列">
+                  右侧
+                </ActionBtn>
+                <ActionBtn danger onClick={onDeleteColumns} title="删除选区所在列">
+                  删除列
+                </ActionBtn>
+              </div>
+            </div>
           </>
         )}
       </div>
@@ -852,6 +1386,46 @@ const dropdownStyle: React.CSSProperties = {
   height: 24,
   cursor: 'pointer',
 };
+
+/**
+ * 渲染工具栏文字按钮。
+ *
+ * @param props - 按钮属性
+ * @returns 工具栏文字按钮节点
+ * @author liangzai927
+ */
+function ActionBtn({
+  onClick,
+  title,
+  danger,
+  children,
+}: {
+  readonly onClick?: () => void;
+  readonly title?: string;
+  readonly danger?: boolean;
+  readonly children: React.ReactNode;
+}) {
+  return (
+    <button
+      onClick={onClick}
+      title={title}
+      style={{
+        minWidth: 58,
+        height: 26,
+        padding: '0 10px',
+        fontSize: 12,
+        border: `1px solid ${danger ? '#ffd6d6' : '#cfd8e3'}`,
+        borderRadius: 6,
+        background: danger ? '#fff7f7' : '#fff',
+        color: danger ? '#c2410c' : '#263445',
+        cursor: 'pointer',
+        boxShadow: '0 1px 2px rgba(15, 23, 42, 0.04)',
+      }}
+    >
+      {children}
+    </button>
+  );
+}
 
 function IconBtn({
   disabled,
@@ -1205,17 +1779,19 @@ function MergeContentDialog({
           width: 360,
           boxShadow: '0 8px 32px rgba(0,0,0,0.2)',
         }}
-        onClick={(e) => e.stopPropagation()}
+        onClick={(e) => {
+          e.stopPropagation();
+        }}
       >
-        <h3 style={{ margin: '0 0 12px', fontSize: 16, fontWeight: 600 }}>
-          合并单元格
-        </h3>
+        <h3 style={{ margin: '0 0 12px', fontSize: 16, fontWeight: 600 }}>合并单元格</h3>
         <p style={{ margin: '0 0 20px', fontSize: 13, color: '#555', lineHeight: 1.6 }}>
           选区内多个单元格包含内容。请选择如何处理：
         </p>
         <div style={{ display: 'flex', flexDirection: 'column', gap: 10 }}>
           <button
-            onClick={() => onConfirm(false)}
+            onClick={() => {
+              onConfirm(false);
+            }}
             style={{
               padding: '10px 14px',
               fontSize: 13,
@@ -1232,7 +1808,9 @@ function MergeContentDialog({
             </span>
           </button>
           <button
-            onClick={() => onConfirm(true)}
+            onClick={() => {
+              onConfirm(true);
+            }}
             style={{
               padding: '10px 14px',
               fontSize: 13,

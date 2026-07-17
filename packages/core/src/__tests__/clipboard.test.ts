@@ -1,7 +1,14 @@
 import { describe, expect, it } from 'vitest';
 
-import { extractCellRangeText, pasteCellRangeText } from '../clipboard';
+import {
+  extractCellRangeText,
+  pasteCellRangeStructured,
+  pasteCellRangeText,
+  serializeCellRange,
+  tryParseClipboardPayload,
+} from '../clipboard';
 import { createSheetData, getCellData, setCellValue } from '../sheet-model';
+import { cellKey } from '../types';
 
 function buildSheet(
   values: Array<Array<string | number | boolean | null>>,
@@ -89,5 +96,51 @@ describe('pasteCellRangeText', () => {
     const sheet = buildSheet([['before']]);
     const updated = pasteCellRangeText(sheet, 0, 0, '');
     expect(getCellData(updated, 0, 0)?.value).toBeNull();
+  });
+});
+
+describe('serializeCellRange', () => {
+  it('should include source range origin for formula paste offset', () => {
+    const sheet = buildSheet([['A']]);
+    const payload = tryParseClipboardPayload(
+      serializeCellRange(sheet, { startRow: 2, startCol: 3, endRow: 2, endCol: 3 }),
+    );
+
+    expect(payload).toMatchObject({
+      sourceStartRow: 2,
+      sourceStartCol: 3,
+    });
+  });
+});
+
+describe('pasteCellRangeStructured', () => {
+  it('should preserve formula metadata when pasting structured cells', () => {
+    const cells = new Map([
+      [
+        cellKey(0, 0),
+        {
+          value: 3,
+          displayValue: '3',
+          formula: '=A1+B1',
+        },
+      ],
+    ]);
+    const sheet = {
+      ...createSheetData({ colCount: 4, rowCount: 4 }),
+      cells,
+    };
+    const payload = tryParseClipboardPayload(
+      serializeCellRange(sheet, { startRow: 0, startCol: 0, endRow: 0, endCol: 0 }),
+    );
+
+    if (!payload) throw new Error('Expected clipboard payload');
+
+    const updated = pasteCellRangeStructured(sheet, 1, 1, payload);
+
+    expect(getCellData(updated, 1, 1)).toMatchObject({
+      value: 3,
+      displayValue: '3',
+      formula: '=A1+B1',
+    });
   });
 });

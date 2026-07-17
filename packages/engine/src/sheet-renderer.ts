@@ -1,4 +1,10 @@
-import type { CellPosition, CellRange, CellStyle, SheetData } from '@universal-sheet/core';
+import type {
+  CellPosition,
+  CellRange,
+  CellStyle,
+  ClipboardPayload,
+  SheetData,
+} from '@universal-sheet/core';
 import {
   clearCellRange,
   createPosition,
@@ -47,6 +53,29 @@ export interface SelectionRange {
   readonly endCol: number;
 }
 
+export type SheetContextMenuTarget =
+  | {
+      readonly type: 'cell';
+      readonly pos: CellPosition;
+    }
+  | {
+      readonly type: 'row-header';
+      readonly pos: CellPosition;
+      readonly row: number;
+    }
+  | {
+      readonly type: 'column-header';
+      readonly pos: CellPosition;
+      readonly col: number;
+    };
+
+export interface FormulaReferenceHighlight {
+  readonly range: CellRange;
+  readonly color: string;
+}
+
+type SelectionActiveCell = 'start' | 'end';
+
 /** Creates a normalized SelectionRange regardless of direction. */
 export function normalizeRange(r1: number, c1: number, r2: number, c2: number): SelectionRange {
   return {
@@ -71,12 +100,27 @@ export interface RendererConfig {
    *  (Enter / double-click). Text input is captured by a proxy element
    *  in the UI layer so IME composition works correctly. */
   readonly onEditStart?: () => void;
+  /** Returns true when the UI is picking formula references from the grid. */
+  readonly isFormulaReferenceMode?: () => boolean;
+  /** Called when a cell is clicked while picking formula references. */
+  readonly onFormulaReferencePick?: (pos: CellPosition) => void;
   /** Called on Ctrl+C with the selected range's text value and optional structured JSON. */
   readonly onCopy?: (value: string, json?: string) => void;
   /** Called on Ctrl+V; the caller should return the text to paste. */
   readonly onPaste?: () => string | null;
-  /** Called on right-click with target cell position and mouse client coordinates. */
-  readonly onContextMenu?: (pos: CellPosition, clientX: number, clientY: number) => void;
+  /** 结构化粘贴前调用，允许 UI 层转换公式等元数据。 */
+  readonly onStructuredPaste?: (
+    sheet: SheetData,
+    startRow: number,
+    startCol: number,
+    payload: ClipboardPayload,
+  ) => SheetData | null;
+  /** Called on right-click with target position/type and mouse client coordinates. */
+  readonly onContextMenu?: (
+    target: SheetContextMenuTarget,
+    clientX: number,
+    clientY: number,
+  ) => void;
   /** Called whenever the viewport changes (scroll / zoom / resize). */
   readonly onViewportChange?: () => void;
   /** Called when a column width is changed by dragging. */
@@ -105,13 +149,26 @@ export class SheetRenderer {
   private isMouseDownOnGrid = false;
   private onSelectionChange?: (pos: CellPosition | null) => void;
   private onEditStart?: (initial?: string) => void;
+  private isFormulaReferenceMode?: () => boolean;
+  private onFormulaReferencePick?: (pos: CellPosition) => void;
   private onCopy?: (value: string, json?: string) => void;
   private onPaste?: () => string | null;
+  private onStructuredPaste?: (
+    sheet: SheetData,
+    startRow: number,
+    startCol: number,
+    payload: ClipboardPayload,
+  ) => SheetData | null;
   private onViewportChange?: () => void;
   private onColumnResize?: (col: number, width: number) => void;
   private onRowResize?: (row: number, height: number) => void;
   private onSheetMutated?: () => void;
-  private onContextMenu?: (pos: CellPosition, clientX: number, clientY: number) => void;
+  private onContextMenu?: (
+    target: SheetContextMenuTarget,
+    clientX: number,
+    clientY: number,
+  ) => void;
+  private formulaReferenceHighlights: ReadonlyArray<FormulaReferenceHighlight> = [];
 
   /** Range last copied (via Ctrl+C), shown with marching ants border. */
   private copiedRange: CellRange | null = null;
@@ -160,8 +217,11 @@ export class SheetRenderer {
     this.theme = { ...DEFAULT_THEME, ...config.theme };
     this.onSelectionChange = config.onSelectionChange;
     this.onEditStart = config.onEditStart;
+    this.isFormulaReferenceMode = config.isFormulaReferenceMode;
+    this.onFormulaReferencePick = config.onFormulaReferencePick;
     this.onCopy = config.onCopy;
     this.onPaste = config.onPaste;
+    this.onStructuredPaste = config.onStructuredPaste;
     this.onViewportChange = config.onViewportChange;
     this.onColumnResize = config.onColumnResize;
     this.onRowResize = config.onRowResize;
@@ -207,6 +267,7 @@ export class SheetRenderer {
   updateSheet(sheet: SheetData): void {
     this.sheet = sheet;
     this.recalcContentSize();
+    this.viewport = clampViewport(this.viewport, this.contentSize);
     this.queueRender();
   }
 
@@ -289,10 +350,6 @@ export class SheetRenderer {
   }
 
   /**
-   * Programmatically selects a cell range (for undo/redo after multi-cell
-   * operations like paste).
-   */
-  /**
    * Applies a cell style to the current selection or single cell.
    * For single-cell selections the style goes to that cell; for ranges
    * the style is applied to every cell in the range.
@@ -317,9 +374,24 @@ export class SheetRenderer {
     return getMergeByAnchor(this.sheet, row, col) !== null;
   }
 
-  selectRange(range: CellRange): void {
-    this.selectedCell = createPosition(range.endRow, range.endCol);
-    this.selectionAnchor = createPosition(range.startRow, range.startCol);
+  /**
+   * Programmatically selects a cell range.
+   *
+   * @param range - Range to select
+   * @param activeCell - Which corner should be treated as the active cell
+   */
+  selectRange(range: CellRange, activeCell: SelectionActiveCell = 'end'): void {
+    const selected =
+      activeCell === 'start'
+        ? createPosition(range.startRow, range.startCol)
+        : createPosition(range.endRow, range.endCol);
+    const anchor =
+      activeCell === 'start'
+        ? createPosition(range.endRow, range.endCol)
+        : createPosition(range.startRow, range.startCol);
+
+    this.selectedCell = selected;
+    this.selectionAnchor = anchor;
     this.selectionType = 'cell';
     this.onSelectionChange?.(this.selectedCell);
     this.queueRender();
@@ -377,7 +449,8 @@ export class SheetRenderer {
     if (json) {
       const payload = tryParseClipboardPayload(json);
       updated = payload
-        ? pasteCellRangeStructured(this.sheet, pos.row, pos.col, payload)
+        ? (this.onStructuredPaste?.(this.sheet, pos.row, pos.col, payload) ??
+          pasteCellRangeStructured(this.sheet, pos.row, pos.col, payload))
         : pasteCellRangeText(this.sheet, pos.row, pos.col, text);
     } else {
       updated = pasteCellRangeText(this.sheet, pos.row, pos.col, text);
@@ -393,6 +466,16 @@ export class SheetRenderer {
   clearCopiedRange(): void {
     this.copiedRange = null;
     this.cutRange = null;
+    this.queueRender();
+  }
+
+  /**
+   * Updates formula reference highlights and re-renders.
+   *
+   * @param highlights - Formula reference ranges with display colors
+   */
+  setFormulaReferenceHighlights(highlights: ReadonlyArray<FormulaReferenceHighlight>): void {
+    this.formulaReferenceHighlights = highlights;
     this.queueRender();
   }
 
@@ -499,6 +582,11 @@ export class SheetRenderer {
 
   /** Double-click on a cell starts editing. */
   private handleDblClick(e: MouseEvent): void {
+    if (this.isFormulaReferenceMode?.() === true) {
+      e.preventDefault();
+      return;
+    }
+
     const rect = this.canvas.getBoundingClientRect();
     const x = e.clientX - rect.left;
     const y = e.clientY - rect.top;
@@ -524,6 +612,36 @@ export class SheetRenderer {
     const rect = this.canvas.getBoundingClientRect();
     const x = e.clientX - rect.left;
     const y = e.clientY - rect.top;
+    const colHeaderClick = this.isInColumnHeader(x, y);
+    if (colHeaderClick >= 0) {
+      this.selectColumnHeaderForContextMenu(colHeaderClick);
+      this.onContextMenu?.(
+        {
+          type: 'column-header',
+          pos: createPosition(0, colHeaderClick),
+          col: colHeaderClick,
+        },
+        e.clientX,
+        e.clientY,
+      );
+      return;
+    }
+
+    const rowHeaderClick = this.isInRowHeader(x, y);
+    if (rowHeaderClick >= 0) {
+      this.selectRowHeaderForContextMenu(rowHeaderClick);
+      this.onContextMenu?.(
+        {
+          type: 'row-header',
+          pos: createPosition(rowHeaderClick, 0),
+          row: rowHeaderClick,
+        },
+        e.clientX,
+        e.clientY,
+      );
+      return;
+    }
+
     const pos = this.pixelToCell(x, y);
 
     if (pos) {
@@ -544,8 +662,52 @@ export class SheetRenderer {
         this.queueRender();
       }
 
-      this.onContextMenu?.(pos, e.clientX, e.clientY);
+      this.onContextMenu?.({ type: 'cell', pos }, e.clientX, e.clientY);
     }
+  }
+
+  /**
+   * 右键列头时同步列选区。
+   *
+   * @param col - 命中的列索引
+   * @author liangzai927
+   */
+  private selectColumnHeaderForContextMenu(col: number): void {
+    const range = this.getCurrentSelectionRange();
+    const inSelectedColumns =
+      this.selectionType === 'column' &&
+      range !== null &&
+      col >= range.startCol &&
+      col <= range.endCol;
+    if (inSelectedColumns) return;
+
+    this.selectionType = 'column';
+    this.selectedCell = createPosition(0, col);
+    this.selectionAnchor = createPosition(this.sheet.config.rowCount - 1, col);
+    this.onSelectionChange?.(this.selectedCell);
+    this.queueRender();
+  }
+
+  /**
+   * 右键行头时同步行选区。
+   *
+   * @param row - 命中的行索引
+   * @author liangzai927
+   */
+  private selectRowHeaderForContextMenu(row: number): void {
+    const range = this.getCurrentSelectionRange();
+    const inSelectedRows =
+      this.selectionType === 'row' &&
+      range !== null &&
+      row >= range.startRow &&
+      row <= range.endRow;
+    if (inSelectedRows) return;
+
+    this.selectionType = 'row';
+    this.selectedCell = createPosition(row, 0);
+    this.selectionAnchor = createPosition(row, this.sheet.config.colCount - 1);
+    this.onSelectionChange?.(this.selectedCell);
+    this.queueRender();
   }
 
   /**
@@ -727,6 +889,15 @@ export class SheetRenderer {
     const rect = this.canvas.getBoundingClientRect();
     const x = e.clientX - rect.left;
     const y = e.clientY - rect.top;
+
+    if (this.isFormulaReferenceMode?.() === true) {
+      const pos = this.pixelToCell(x, y);
+      if (pos) {
+        this.onFormulaReferencePick?.(pos);
+        e.preventDefault();
+        return;
+      }
+    }
 
     /* Column resize: start dragging if mouse is near a column edge. */
     const edgeCol = this.detectColumnEdge(x, y);
@@ -1382,6 +1553,7 @@ export class SheetRenderer {
     this.renderGridLines();
     this.renderCells();
     this.renderSelectionFill();
+    this.renderFormulaReferenceHighlights();
     this.renderSelectionBorder();
     this.renderMarchingAnts();
     ctx.restore();
@@ -1863,6 +2035,35 @@ export class SheetRenderer {
       ctx.strokeStyle = theme.selectionBorder;
       ctx.lineWidth = 2 / this.viewport.zoom;
       ctx.strokeRect(rngX, rngY, rngW, rngH);
+    }
+  }
+
+  /**
+   * Draws colored borders for formula references while editing a formula.
+   */
+  private renderFormulaReferenceHighlights(): void {
+    if (this.formulaReferenceHighlights.length === 0) return;
+
+    const { ctx } = this;
+    for (const highlight of this.formulaReferenceHighlights) {
+      const { range, color } = highlight;
+      const x = this.getColumnX(range.startCol);
+      const y = this.getRowY(range.startRow);
+      let width = 0;
+      for (let col = range.startCol; col <= range.endCol; col += 1) {
+        width += getColumnWidth(this.sheet, col);
+      }
+      let height = 0;
+      for (let row = range.startRow; row <= range.endRow; row += 1) {
+        height += getRowHeight(this.sheet, row);
+      }
+
+      ctx.save();
+      ctx.strokeStyle = color;
+      ctx.lineWidth = 2 / this.viewport.zoom;
+      ctx.setLineDash([6 / this.viewport.zoom, 3 / this.viewport.zoom]);
+      ctx.strokeRect(x, y, width, height);
+      ctx.restore();
     }
   }
 

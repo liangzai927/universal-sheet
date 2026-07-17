@@ -1,4 +1,4 @@
-import { getCellData, setCellStyle, setCellValue } from './sheet-model';
+import { getCellData, setCellValue } from './sheet-model';
 import type { CellRange, CellStyle, SheetData } from './types';
 import { cellKey } from './types';
 
@@ -90,7 +90,7 @@ export function clearCellRange(sheet: SheetData, range: CellRange): SheetData {
 /*  Structured clipboard (preserves styles, formulas, etc.)            */
 /* ------------------------------------------------------------------ */
 
-interface SerializedCell {
+export interface SerializedCell {
   /** Relative row within the copied range (0-based). */
   readonly r: number;
   /** Relative col within the copied range (0-based). */
@@ -101,9 +101,13 @@ interface SerializedCell {
   readonly style?: CellStyle;
 }
 
-interface ClipboardPayload {
+export interface ClipboardPayload {
   readonly type: 'universal-sheet-cells';
   readonly version: 1;
+  /** 原始复制区域起始行，用于粘贴时计算公式相对引用偏移。 */
+  readonly sourceStartRow?: number;
+  /** 原始复制区域起始列，用于粘贴时计算公式相对引用偏移。 */
+  readonly sourceStartCol?: number;
   readonly rows: number;
   readonly cols: number;
   readonly cells: Array<SerializedCell>;
@@ -158,6 +162,8 @@ export function serializeCellRange(sheet: SheetData, range: CellRange): string {
   const payload: ClipboardPayload = {
     type: 'universal-sheet-cells',
     version: 1,
+    sourceStartRow: range.startRow,
+    sourceStartCol: range.startCol,
     rows: range.endRow - range.startRow + 1,
     cols: range.endCol - range.startCol + 1,
     cells,
@@ -200,22 +206,22 @@ export function pasteCellRangeStructured(
 ): SheetData {
   const { rowCount, colCount } = sheet.config;
   let updated = sheet;
+  const nextCells = new Map(sheet.cells);
 
   for (const sc of payload.cells) {
     const targetRow = startRow + sc.r;
     const targetCol = startCol + sc.c;
     if (targetRow >= rowCount || targetCol >= colCount) continue;
 
-    /* Apply value. */
-    updated = setCellValue(updated, targetRow, targetCol, sc.value);
-
-    /* Apply style if present. */
-    if (sc.style) {
-      updated = setCellStyle(updated, targetRow, targetCol, sc.style);
-    }
-
-    /* TODO: apply formula when formula engine is ready. */
+    nextCells.set(cellKey(targetRow, targetCol), {
+      value: sc.value,
+      displayValue: sc.displayValue,
+      formula: sc.formula,
+      style: sc.style,
+    });
   }
+
+  updated = { ...updated, cells: nextCells };
 
   /* Re-create merges from the payload. */
   if (payload.merges) {
